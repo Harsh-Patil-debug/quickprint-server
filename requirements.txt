@@ -1,0 +1,43 @@
+# QuickPrint backend dependencies
+# Mirrors khelomore-server/requirements.txt exactly where the same building blocks are
+# used (Django/DRF, MongoDB, auth/crypto, Google Sign-In, Cashfree via requests, media
+# uploads) — only additions are pypdf (real PDF page counting) and the removal of
+# QuickPrint-irrelevant pieces (TOTP/QR, APScheduler, geopy) until actually needed.
+
+# ── Django / API ──────────────────────────────
+Django==4.2.30
+djangorestframework==3.14.0
+django-cors-headers==4.5.0
+asgiref==3.8.1
+sqlparse==0.5.5
+gunicorn==21.2.0
+
+# ── MongoDB ───────────────────────────────────
+pymongo==3.11.4
+# pymongo needs dnspython at runtime to resolve mongodb+srv:// URIs (MongoDB Atlas's
+# standard connection string format) — see khelomore-server/requirements.txt for why
+# this is easy to miss in a static import audit.
+dnspython==2.7.0
+
+# ── Auth / crypto ─────────────────────────────
+PyJWT==2.10.1
+argon2-cffi==25.1.0
+pycryptodome==3.21.0
+
+# ── Google Sign-In ────────────────────────────
+google-auth==2.37.0
+
+# ── Payments ───────────────────────────────────
+# Cashfree integration talks to their REST API directly via `requests` (see HTTP /
+# parsing below) — no gateway-specific SDK dependency, matching khelomore-server.
+
+# ── Media / document uploads ──────────────────
+cloudinary==1.44.2
+# Real server-side PDF page counting (replaces the frontend prototype's file-size guess).
+pypdf==5.1.0
+
+# ── HTTP / parsing ─────────────────────────────
+requests==2.32.3
+
+# ── Config ──────────────────────────────────────
+python-dotenv==1.0.1
