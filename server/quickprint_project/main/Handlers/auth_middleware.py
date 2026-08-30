@@ -4,6 +4,7 @@
 # why) and two-role model (customer / shop_staff, distinguished by the JWT's own "role"
 # claim from auth_handler.generate_token, not by which cookie arrived).
 
+import hmac
 from django.conf import settings
 from rest_framework.response import Response
 from rest_framework import status
@@ -71,7 +72,7 @@ def authenticate_admin_request(request):
         return False, Response({"error": "Authorization header is malformed"}, status=status.HTTP_401_UNAUTHORIZED)
     token = parts[1].strip()
     expected_token = getattr(settings, "ADMIN_TOKEN", "")
-    if not expected_token or token != expected_token:
+    if not expected_token or not hmac.compare_digest(token, expected_token):
         return False, Response({"error": "Invalid admin authorization token"}, status=status.HTTP_401_UNAUTHORIZED)
     return True, None
 
@@ -91,7 +92,11 @@ def authenticate_super_admin_request(request):
         return None, Response({"error": "Authorization token missing or invalid"}, status=status.HTTP_401_UNAUTHORIZED)
 
     expected_static = getattr(settings, "ADMIN_TOKEN", "")
-    if expected_static and token == expected_static:
+    # Constant-time comparison — a plain == leaks how many leading characters matched via
+    # response timing, in principle letting an attacker recover ADMIN_TOKEN byte-by-byte
+    # over many requests. Low practical risk over the internet (network jitter dwarfs the
+    # signal), but hmac.compare_digest closes it for free.
+    if expected_static and hmac.compare_digest(token, expected_static):
         return "super_admin_static", None
 
     try:

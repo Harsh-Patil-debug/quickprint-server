@@ -269,8 +269,14 @@ class SuperAdminMeView(APIView):
 
 
 class SuperAdminLogoutView(APIView):
-    """POST /super-admin/logout/"""
+    """POST /super-admin/logout/ — same auth-then-revoke shape as CustomerLogoutView /
+    ShopStaffLogoutView, for consistency (revoking is a self-only action either way — a
+    caller can only ever revoke the exact token they already hold — but requiring a valid
+    session first keeps this endpoint from being a no-auth-required token-string parser)."""
     def post(self, request):
+        _, error_response = auth_middleware.authenticate_super_admin_request(request)
+        if error_response:
+            return error_response
         auth_header = request.headers.get("Authorization", "")
         token = auth_header.split(" ")[1].strip() if auth_header.startswith("Bearer ") else ""
         auth_handler.revoke_token(token)

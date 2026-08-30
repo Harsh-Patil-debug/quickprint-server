@@ -5,23 +5,27 @@ SuperAdminRegisterView (POST /super-admin/register/) deliberately requires an
 already-authenticated super admin (or the static ADMIN_TOKEN) to create a NEW super_admin
 account — otherwise anyone could self-provision one. That guard lives at the view layer,
 so this script bypasses it on purpose by calling auth_handler.register_super_admin()
-directly, then immediately verifying the OTP it prints to your console (DEBUG=True logs it)
-so the account is Active and ready to log in with — no email needed for this one-time step.
+directly, then verifies the OTP (printed to this console — DEBUG=True logs it) so the
+account is Active and ready to log in with, no email needed for this one-time step.
 
 Usage:
-    python create_super_admin.py <name> <email> <password>
+    python create_super_admin.py <name> <email>
+
+You'll be prompted for the password interactively (not as a CLI argument — an argument
+would land in your shell history and be visible to anything reading the process list
+while this runs).
 
 Example:
-    python create_super_admin.py "Harsh Patil" harsh@quickprint.app "a-strong-password123"
+    python create_super_admin.py "Harsh Patil" harsh@quickprint.app
 
-After this, log in normally at the admin panel's /admin/login page — subsequent super
-admin accounts can be created from within the app itself once you're logged in.
+After this, log in normally at the admin panel's /login page — subsequent super admin
+accounts can be created from within the app itself once you're logged in.
 """
 
 import os
 import sys
-import json
 import base64
+import getpass
 import django
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -42,14 +46,20 @@ def _encrypt(plain: str, iv_bytes: bytes) -> str:
 
 
 def main():
-    if len(sys.argv) != 4:
+    if len(sys.argv) != 3:
         print(__doc__)
         sys.exit(1)
 
-    name, email, password = sys.argv[1], sys.argv[2].strip().lower(), sys.argv[3]
+    name, email = sys.argv[1], sys.argv[2].strip().lower()
 
     if db_main.super_admin.find_one({"email": email}):
         print(f"A super admin account already exists for {email}. Nothing to do.")
+        sys.exit(1)
+
+    password = getpass.getpass("Set a password for this account: ")
+    password_confirm = getpass.getpass("Confirm password: ")
+    if password != password_confirm:
+        print("Passwords did not match.")
         sys.exit(1)
 
     iv_bytes = get_random_bytes(16)
@@ -58,21 +68,14 @@ def main():
     email_enc = _encrypt(email, iv_bytes)
     password_enc = _encrypt(password, iv_bytes)
 
-    print(f"[1/2] Registering {email}...")
+    print(f"\n[1/2] Registering {email}...")
     result, status = auth_handler.register_super_admin(name_enc, email_enc, password_enc, iv_b64)
     if status != 200:
         print(f"Registration failed: {result}")
         sys.exit(1)
 
-    # DEBUG=True already printed the real OTP to this console — pull it straight from the
-    # DB instead of asking you to retype it.
-    admin = db_main.super_admin.find_one({"email": email})
-    otp_code = None
-    # otp_code is stored hashed — but since we're running this in-process, re-generate the
-    # verification by re-reading what register_super_admin just wrote is not possible (it's
-    # hashed). Simplest correct path: just tell the operator to check the console output
-    # above for the OTP and finish verification via the actual login/verify-otp UI, OR
-    # verify right here by prompting for it.
+    # otp_code is stored hashed, not retrievable — DEBUG=True already printed the real
+    # code to this console above (via email_handler.send_otp_email), so just ask for it.
     otp_code = input("Enter the OTP printed above to activate this account: ").strip()
 
     verify_iv_bytes = get_random_bytes(16)
@@ -86,7 +89,7 @@ def main():
         print(f"Verification failed: {verify_result}")
         sys.exit(1)
 
-    print(f"\nSuper admin account for {email} is now Active. Log in at the admin panel's /admin/login page.")
+    print(f"\nSuper admin account for {email} is now Active. Log in at the admin panel's /login page.")
 
 
 if __name__ == "__main__":
