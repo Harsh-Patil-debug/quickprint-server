@@ -20,6 +20,18 @@ urlpatterns = [
     path('auth/logout/', CustomerLogoutView.as_view(), name='customer_logout'),
     path('auth/me/', CustomerMeView.as_view(), name='customer_me'),
 
+    # ── Super admin auth ─────────────────────────────────────────────────────
+    path('super-admin/register/', SuperAdminRegisterView.as_view(), name='super_admin_register'),
+    path('super-admin/login/', SuperAdminLoginView.as_view(), name='super_admin_login'),
+    path('super-admin/verify-otp/', SuperAdminVerifyOTPView.as_view(), name='super_admin_verify_otp'),
+    path('super-admin/resend-otp/', SuperAdminResendOTPView.as_view(), name='super_admin_resend_otp'),
+    path('super-admin/logout/', SuperAdminLogoutView.as_view(), name='super_admin_logout'),
+    path('super-admin/me/', SuperAdminMeView.as_view(), name='super_admin_me'),
+
+    # ── Partner applications ─────────────────────────────────────────────────
+    path('partner-applications/', PartnerApplicationListCreateView.as_view(), name='partner_applications'),
+    path('partner-applications/<str:app_id>/', PartnerApplicationDetailView.as_view(), name='partner_application_detail'),
+
     # ── Shop staff auth ──────────────────────────────────────────────────────
     path('shop-auth/register/', ShopStaffRegisterView.as_view(), name='shop_staff_register'),
     path('shop-auth/signup/', ShopOwnerSignupView.as_view(), name='shop_owner_signup'),

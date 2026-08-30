@@ -61,8 +61,7 @@ def authenticate_shop_staff_request(request):
 
 def authenticate_admin_request(request):
     """
-    Validates the static platform ADMIN_TOKEN — used only for the one-time shop-seeding
-    endpoint (there's no super-admin panel in v1). Returns (True, None) or (False, Response).
+    Validates the static platform ADMIN_TOKEN. Returns (True, None) or (False, Response).
     """
     auth_header = request.headers.get("Authorization")
     if not auth_header or not auth_header.startswith("Bearer "):
@@ -75,3 +74,37 @@ def authenticate_admin_request(request):
     if not expected_token or token != expected_token:
         return False, Response({"error": "Invalid admin authorization token"}, status=status.HTTP_401_UNAUTHORIZED)
     return True, None
+
+
+def authenticate_super_admin_request(request):
+    """
+    Validates EITHER the static ADMIN_TOKEN OR a dynamic super_admin JWT — same dual-path
+    model as khelomore-server's authenticate_super_admin_request. The static token stays
+    valid so nothing that already used it (e.g. the admin panel's original hardcoded
+    VITE_ADMIN_TOKEN setup) breaks; a real logged-in super admin's JWT works too, and is
+    what the login/signup flow now issues. Returns (identifier, None) on success —
+    identifier is "super_admin_static" for the static-token path, or the admin's own email
+    for a real session — or (None, Response) on failure.
+    """
+    token = _extract_bearer_token(request)
+    if not token:
+        return None, Response({"error": "Authorization token missing or invalid"}, status=status.HTTP_401_UNAUTHORIZED)
+
+    expected_static = getattr(settings, "ADMIN_TOKEN", "")
+    if expected_static and token == expected_static:
+        return "super_admin_static", None
+
+    try:
+        payload = auth_handler.verify_token(token)
+    except Exception as e:
+        return None, Response({"error": f"Invalid token: {str(e)}"}, status=status.HTTP_401_UNAUTHORIZED)
+    if payload["role"] != "super_admin":
+        return None, Response({"error": "Access denied. Not a super admin."}, status=status.HTTP_403_FORBIDDEN)
+
+    from .db_connection import db_main
+    admin = db_main.super_admin.find_one({"email": payload["email"]})
+    if not admin:
+        return None, Response({"error": "Access denied. Not a super admin."}, status=status.HTTP_403_FORBIDDEN)
+    if admin.get("status") != "Active":
+        return None, Response({"error": "Super admin account is not active."}, status=status.HTTP_403_FORBIDDEN)
+    return payload["email"], None

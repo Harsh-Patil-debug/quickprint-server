@@ -17,6 +17,33 @@ DOCX_CONTENT_TYPES = {
 }
 
 
+ALLOWED_IMAGE_CONTENT_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+MAX_IMAGE_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MB
+
+
+def validate_image_upload(uploaded_file):
+    """
+    Returns None if the file is an acceptable image upload, otherwise an error message.
+    Used by the partner-application form's shop photos/logo — mirrors
+    khelomore-server/.../Handlers/upload_validation.py's validate_image_upload exactly.
+
+    SVG is deliberately excluded — it can embed <script> tags and is a well-known stored-XSS
+    vector whenever served back and rendered inline.
+    """
+    if uploaded_file is None:
+        return None
+
+    content_type = getattr(uploaded_file, "content_type", None)
+    if content_type not in ALLOWED_IMAGE_CONTENT_TYPES:
+        return f"Unsupported file type '{content_type}'. Allowed: JPEG, PNG, WEBP, GIF."
+
+    size = getattr(uploaded_file, "size", None)
+    if size is not None and size > MAX_IMAGE_UPLOAD_BYTES:
+        return f"File too large ({size} bytes). Maximum allowed is {MAX_IMAGE_UPLOAD_BYTES} bytes."
+
+    return None
+
+
 def validate_document_upload(uploaded_file):
     """
     Returns None if the file is an acceptable print-job upload, otherwise an error

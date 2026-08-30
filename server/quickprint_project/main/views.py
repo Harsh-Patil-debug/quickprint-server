@@ -22,6 +22,7 @@ from .Handlers import (
     shops,
     uploads,
     orders_handler,
+    partner_applications,
 )
 
 
@@ -170,6 +171,146 @@ class CustomerMeView(APIView):
         if not user:
             return Response({"error": "Account not found."}, status=404)
         return Response({"id": str(user["_id"]), "email": email, "name": user.get("name", "")})
+
+
+# ── Super admin auth ────────────────────────────────────────────────────────────
+# Email+password + OTP, AES-256-CBC encrypted payloads — same security model as
+# khelomore-server's super_admin flow. Register is itself gated so only an
+# already-authenticated super admin (or the static ADMIN_TOKEN) can provision another
+# one; the very first account is created via create_super_admin.py (see that script).
+
+def _reject_unauthorized_super_admin_register(request):
+    """SECURITY: without this, anyone could hit /super-admin/register/ and self-provision
+    a super admin account. Returns a 403 Response if blocked, otherwise None."""
+    _, error_response = auth_middleware.authenticate_super_admin_request(request)
+    if error_response:
+        return Response({"error": "Not authorized to create a super admin account."}, status=403)
+    return None
+
+
+class SuperAdminRegisterView(APIView):
+    """POST /super-admin/register/ — Body: { name, email, password, iv } (AES-CBC encrypted)"""
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "auth"
+
+    def post(self, request):
+        guard_error = _reject_unauthorized_super_admin_register(request)
+        if guard_error:
+            return guard_error
+        data = request.data
+        result, status_code = auth_handler.register_super_admin(
+            name_enc=data.get("name", ""),
+            email_enc=data.get("email", ""),
+            password_enc=data.get("password", ""),
+            iv=data.get("iv", ""),
+        )
+        return Response(result, status=status_code)
+
+
+class SuperAdminLoginView(APIView):
+    """POST /super-admin/login/ — Body: { email, password, iv } (AES-CBC encrypted)"""
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "auth"
+
+    def post(self, request):
+        data = request.data
+        result, status_code = auth_handler.login_super_admin(
+            email_enc=data.get("email", ""),
+            password_enc=data.get("password", ""),
+            iv=data.get("iv", ""),
+        )
+        return Response(result, status=status_code)
+
+
+class SuperAdminVerifyOTPView(APIView):
+    """POST /super-admin/verify-otp/ — Body: { email, otp_code, iv } (AES-CBC encrypted)"""
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "auth"
+
+    def post(self, request):
+        data = request.data
+        result, status_code = auth_handler.verify_super_admin_otp(
+            email_enc=data.get("email", ""),
+            otp_enc=data.get("otp_code", ""),
+            iv=data.get("iv", ""),
+        )
+        return Response(result, status=status_code)
+
+
+class SuperAdminResendOTPView(APIView):
+    """POST /super-admin/resend-otp/ — Body: { email, iv } (AES-CBC encrypted)"""
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "auth"
+
+    def post(self, request):
+        data = request.data
+        result, status_code = auth_handler.resend_super_admin_otp(
+            email_enc=data.get("email", ""),
+            iv=data.get("iv", ""),
+        )
+        return Response(result, status=status_code)
+
+
+class SuperAdminMeView(APIView):
+    """GET /super-admin/me/ — resolves the current super admin from their Bearer JWT.
+    The static-ADMIN_TOKEN path (authenticate_super_admin_request's other branch) has no
+    real account behind it, so it returns a synthetic identity here rather than 404ing."""
+    def get(self, request):
+        identifier, error_response = auth_middleware.authenticate_super_admin_request(request)
+        if error_response:
+            return error_response
+        if identifier == "super_admin_static":
+            return Response({"user": {"id": "static", "email": "", "name": "Platform Admin", "role": "super_admin"}})
+        from .Handlers.db_connection import db_main
+        admin = db_main.super_admin.find_one({"email": identifier})
+        if not admin:
+            return Response({"error": "Account not found."}, status=404)
+        return Response({"user": {"id": str(admin["_id"]), "email": identifier, "name": admin.get("name", ""), "role": "super_admin"}})
+
+
+class SuperAdminLogoutView(APIView):
+    """POST /super-admin/logout/"""
+    def post(self, request):
+        auth_header = request.headers.get("Authorization", "")
+        token = auth_header.split(" ")[1].strip() if auth_header.startswith("Bearer ") else ""
+        auth_handler.revoke_token(token)
+        return Response({"message": "Logged out."}, status=200)
+
+
+# ── Partner applications ────────────────────────────────────────────────────────
+
+class PartnerApplicationListCreateView(APIView):
+    """
+    POST /partner-applications/ — submit a new application (public, unauthenticated)
+    GET /partner-applications/ — list applications (super admin only)
+    """
+    parser_classes = (MultiPartParser, FormParser)
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "auth"
+
+    def post(self, request):
+        result, status_code = partner_applications.create_partner_application_handler(request.data, request.FILES)
+        return Response(result, status=status_code)
+
+    def get(self, request):
+        _, error_response = auth_middleware.authenticate_super_admin_request(request)
+        if error_response:
+            return error_response
+        result, status_code = partner_applications.get_partner_applications_handler()
+        return Response(result, status=status_code)
+
+
+class PartnerApplicationDetailView(APIView):
+    """PATCH /partner-applications/<app_id>/ — update application status (super admin only)"""
+    def patch(self, request, app_id):
+        _, error_response = auth_middleware.authenticate_super_admin_request(request)
+        if error_response:
+            return error_response
+        status_val = request.data.get("status")
+        if not status_val:
+            return Response({"error": "Status is required."}, status=400)
+        result, status_code = partner_applications.update_partner_application_status_handler(app_id, status_val)
+        return Response(result, status=status_code)
 
 
 # ── Shop staff auth ─────────────────────────────────────────────────────────────
@@ -333,14 +474,14 @@ class AdminShopListCreateView(APIView):
     hand them a login" admin action in one step.
     """
     def get(self, request):
-        is_admin, error_response = auth_middleware.authenticate_admin_request(request)
+        _, error_response = auth_middleware.authenticate_super_admin_request(request)
         if error_response:
             return error_response
         result = shops.admin_list_all_shops_handler()
         return _respond(result)
 
     def post(self, request):
-        is_admin, error_response = auth_middleware.authenticate_admin_request(request)
+        _, error_response = auth_middleware.authenticate_super_admin_request(request)
         if error_response:
             return error_response
         data = request.data
@@ -374,14 +515,14 @@ class AdminShopDetailView(APIView):
     """PATCH /admin/shops/<shop_id>/ — edit any field on any shop.
     DELETE /admin/shops/<shop_id>/ — soft-delete (is_active=False)."""
     def patch(self, request, shop_id):
-        is_admin, error_response = auth_middleware.authenticate_admin_request(request)
+        _, error_response = auth_middleware.authenticate_super_admin_request(request)
         if error_response:
             return error_response
         result = shops.admin_update_shop_handler(shop_id, request.data)
         return _respond(result)
 
     def delete(self, request, shop_id):
-        is_admin, error_response = auth_middleware.authenticate_admin_request(request)
+        _, error_response = auth_middleware.authenticate_super_admin_request(request)
         if error_response:
             return error_response
         result = shops.admin_delete_shop_handler(shop_id)
@@ -391,7 +532,7 @@ class AdminShopDetailView(APIView):
 class AdminShopRestoreView(APIView):
     """POST /admin/shops/<shop_id>/restore/ — undo a soft-delete."""
     def post(self, request, shop_id):
-        is_admin, error_response = auth_middleware.authenticate_admin_request(request)
+        _, error_response = auth_middleware.authenticate_super_admin_request(request)
         if error_response:
             return error_response
         result = shops.admin_restore_shop_handler(shop_id)
@@ -403,7 +544,7 @@ class AdminShopImageUploadView(APIView):
     parser_classes = (MultiPartParser, FormParser)
 
     def post(self, request):
-        is_admin, error_response = auth_middleware.authenticate_admin_request(request)
+        _, error_response = auth_middleware.authenticate_super_admin_request(request)
         if error_response:
             return error_response
         result = uploads.upload_shop_image_handler(request.FILES.get("file"))
