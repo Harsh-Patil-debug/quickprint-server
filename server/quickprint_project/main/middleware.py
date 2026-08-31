@@ -10,7 +10,16 @@ from django.conf import settings
 from django.http import JsonResponse
 
 UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
-AUTH_COOKIE_NAMES = ("qp_customer_token", "qp_shop_token", "qp_super_admin_token")
+# Includes the refresh cookies too — /auth/refresh/ et al. are cookie-authenticated
+# unsafe-method (POST) endpoints just like any other, even though the refresh cookie
+# itself is path-scoped rather than sent on every request. Without listing them here, a
+# cross-site POST to a refresh endpoint would sail through this check entirely (treated
+# as "not cookie-authenticated") since the access-token cookie has usually just expired
+# by the time a refresh call happens.
+AUTH_COOKIE_NAMES = (
+    "qp_customer_token", "qp_shop_token", "qp_super_admin_token",
+    "qp_customer_refresh", "qp_shop_refresh", "qp_super_admin_refresh",
+)
 
 
 class OriginValidationMiddleware:
