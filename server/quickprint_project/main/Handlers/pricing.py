@@ -72,7 +72,11 @@ def price_order(cfg: dict, shop: dict) -> dict:
     page_cost = printed_pages * rate
     duplex_saving = page_cost * 0.1 if cfg.get("duplex") else 0
 
-    addon_ids = cfg.get("addons") or []
+    # De-duped: the frontend's own priceOrder() iterates the fixed ADDONS list and checks
+    # `cfg.addons.includes(id)`, so a repeated id there can never inflate its preview total
+    # — this mirrors that by construction (a set, not the raw list) rather than trusting a
+    # client-supplied array to already be duplicate-free.
+    addon_ids = set(cfg.get("addons") or [])
     addon_unit_cost = sum(ADDONS[a]["price"] for a in addon_ids if a in ADDONS)
     addon_cost = addon_unit_cost * copies
 

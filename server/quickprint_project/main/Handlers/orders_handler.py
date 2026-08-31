@@ -57,6 +57,9 @@ def _next_slot_number(shop_id: str, date_str: str) -> str:
     return f"Slot {count + 1}"
 
 
+MAX_CUSTOM_RANGE_LENGTH = 300
+
+
 def _validate_order_config(cfg: dict, page_count: int) -> str | None:
     if cfg.get("color") not in VALID_COLORS:
         return "Invalid colour option."
@@ -75,10 +78,18 @@ def _validate_order_config(cfg: dict, page_count: int) -> str | None:
         if addon_id not in pricing.ADDONS:
             return f"Unknown add-on '{addon_id}'."
 
+    custom_range = cfg.get("custom_range", "") or ""
+    # SECURITY: cfg arrives straight from the client's JSON body — an unbounded
+    # custom_range string is cheap to send but costs real server time to parse (matches
+    # the frontend's own maxLength=300 on this field; this is the version that actually
+    # can't be bypassed).
+    if len(custom_range) > MAX_CUSTOM_RANGE_LENGTH:
+        return f"Custom range is too long (max {MAX_CUSTOM_RANGE_LENGTH} characters)."
+
     if range_mode == "all":
         selected = page_count
     else:
-        selected = len(pricing.parse_range(cfg.get("custom_range", ""), page_count))
+        selected = len(pricing.parse_range(custom_range, page_count))
     if selected == 0:
         return "Your page range selects zero pages."
     return None
