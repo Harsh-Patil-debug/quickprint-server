@@ -32,10 +32,19 @@ def _respond(result: dict) -> Response:
 
 
 ROLE_COOKIE_NAMES = {"customer": "qp_customer_token", "shop_staff": "qp_shop_token", "super_admin": "qp_super_admin_token"}
-COOKIE_MAX_AGE_SECONDS = 86400  # 24h, matching every role's JWT lifetime now
+ROLE_REFRESH_COOKIE_NAMES = {"customer": "qp_customer_refresh", "shop_staff": "qp_shop_refresh", "super_admin": "qp_super_admin_refresh"}
+# Scopes each refresh cookie to ONLY its own refresh endpoint — the browser then never
+# attaches it to an ordinary API call, unlike the access-token cookie (path="/"). This
+# keeps the long-lived, most-sensitive credential off of every request's cookie header
+# except the one place it's actually needed.
+ROLE_REFRESH_PATHS = {
+    "customer": "/api/v1/main/auth/refresh/",
+    "shop_staff": "/api/v1/main/shop-auth/refresh/",
+    "super_admin": "/api/v1/main/super-admin/refresh/",
+}
 
 
-def _set_role_cookie(response, role: str, token: str):
+def _set_access_cookie(response, role: str, token: str):
     """Same flags as khelomore-server's own auth cookies: HttpOnly (JS can't read it, so
     an XSS can't exfiltrate it directly), Secure (HTTPS only), SameSite=None (the web
     frontends live on a different origin than this API, so the cookie must be sendable
@@ -47,12 +56,25 @@ def _set_role_cookie(response, role: str, token: str):
         httponly=True,
         secure=True,
         samesite="None",
-        max_age=COOKIE_MAX_AGE_SECONDS,
+        max_age=auth_handler.ACCESS_TOKEN_EXP_SECONDS,
     )
 
 
-def _clear_role_cookie(response, role: str):
+def _set_refresh_cookie(response, role: str, token: str):
+    response.set_cookie(
+        key=ROLE_REFRESH_COOKIE_NAMES[role],
+        value=token,
+        httponly=True,
+        secure=True,
+        samesite="None",
+        max_age=auth_handler.REFRESH_TOKEN_EXP_SECONDS,
+        path=ROLE_REFRESH_PATHS[role],
+    )
+
+
+def _clear_role_cookies(response, role: str):
     response.delete_cookie(ROLE_COOKIE_NAMES[role], samesite="None")
+    response.delete_cookie(ROLE_REFRESH_COOKIE_NAMES[role], samesite="None", path=ROLE_REFRESH_PATHS[role])
 
 
 def _is_allowed_oauth_redirect_target(target: str) -> bool:
@@ -142,10 +164,13 @@ class CustomerVerifyOTPView(APIView):
         if status_code == 200:
             try:
                 import json
-                decrypted = auth_handler.decrypt_data(result["encrypted_response"], result["iv"])
-                token = json.loads(decrypted).get("token")
+                decrypted = json.loads(auth_handler.decrypt_data(result["encrypted_response"], result["iv"]))
+                token = decrypted.get("token")
+                refresh_token = decrypted.get("refresh_token")
                 if token:
-                    _set_role_cookie(response_obj, "customer", token)
+                    _set_access_cookie(response_obj, "customer", token)
+                if refresh_token:
+                    _set_refresh_cookie(response_obj, "customer", refresh_token)
             except Exception as e:
                 print(f"[COOKIE ERROR] Failed to set customer auth cookie: {e}")
         return response_obj
@@ -253,7 +278,9 @@ class CustomerGoogleCallbackView(APIView):
         redirect_url = f"{state}{separator}encrypted_response={quote(enc_resp)}&iv={quote(iv)}"
         response = HttpResponse(status=302)
         response["Location"] = redirect_url
-        _set_role_cookie(response, "customer", result["token"])
+        _set_access_cookie(response, "customer", result["token"])
+        if result.get("refresh_token"):
+            _set_refresh_cookie(response, "customer", result["refresh_token"])
         return response
 
 
@@ -266,8 +293,9 @@ class CustomerLogoutView(APIView):
         auth_header = request.headers.get("Authorization", "")
         token = auth_header.split(" ")[1].strip() if auth_header.startswith("Bearer ") else request.COOKIES.get("qp_customer_token", "")
         auth_handler.revoke_token(token)
+        auth_handler.revoke_refresh_family(request.COOKIES.get("qp_customer_refresh", ""))
         response_obj = Response({"message": "Logged out."}, status=200)
-        _clear_role_cookie(response_obj, "customer")
+        _clear_role_cookies(response_obj, "customer")
         return response_obj
 
 
@@ -282,6 +310,28 @@ class CustomerMeView(APIView):
         if not user:
             return Response({"error": "Account not found."}, status=404)
         return Response({"id": str(user["_id"]), "email": email, "name": user.get("name", "")})
+
+
+class CustomerRefreshView(APIView):
+    """POST /auth/refresh/ — reads the qp_customer_refresh cookie (path-scoped to this
+    endpoint), rotates it, and returns a fresh access token. On failure (expired, unknown,
+    or reused — see auth_handler.refresh_access_token's reuse-detection) both cookies are
+    cleared so the frontend's silent-refresh interceptor falls through to a real login."""
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "auth"
+
+    def post(self, request):
+        raw_refresh = request.COOKIES.get("qp_customer_refresh") or request.data.get("refresh_token", "")
+        pair = auth_handler.refresh_access_token(raw_refresh, role="customer")
+        if not pair:
+            response_obj = Response({"error": "Session expired. Please log in again."}, status=401)
+            _clear_role_cookies(response_obj, "customer")
+            return response_obj
+        access_token, refresh_token = pair
+        response_obj = Response({"token": access_token}, status=200)
+        _set_access_cookie(response_obj, "customer", access_token)
+        _set_refresh_cookie(response_obj, "customer", refresh_token)
+        return response_obj
 
 
 # ── Super admin auth ────────────────────────────────────────────────────────────
@@ -353,10 +403,13 @@ class SuperAdminVerifyOTPView(APIView):
         if status_code == 200:
             try:
                 import json
-                decrypted = auth_handler.decrypt_data(result["encrypted_response"], result["iv"])
-                token = json.loads(decrypted).get("token")
+                decrypted = json.loads(auth_handler.decrypt_data(result["encrypted_response"], result["iv"]))
+                token = decrypted.get("token")
+                refresh_token = decrypted.get("refresh_token")
                 if token:
-                    _set_role_cookie(response_obj, "super_admin", token)
+                    _set_access_cookie(response_obj, "super_admin", token)
+                if refresh_token:
+                    _set_refresh_cookie(response_obj, "super_admin", refresh_token)
             except Exception as e:
                 print(f"[COOKIE ERROR] Failed to set super admin auth cookie: {e}")
         return response_obj
@@ -418,6 +471,25 @@ class SuperAdminMeView(APIView):
         return Response({"user": {"id": str(admin["_id"]), "email": identifier, "name": admin.get("name", ""), "role": "super_admin"}})
 
 
+class SuperAdminRefreshView(APIView):
+    """POST /super-admin/refresh/ — same rotation pattern as CustomerRefreshView."""
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "auth"
+
+    def post(self, request):
+        raw_refresh = request.COOKIES.get("qp_super_admin_refresh") or request.data.get("refresh_token", "")
+        pair = auth_handler.refresh_access_token(raw_refresh, role="super_admin")
+        if not pair:
+            response_obj = Response({"error": "Session expired. Please log in again."}, status=401)
+            _clear_role_cookies(response_obj, "super_admin")
+            return response_obj
+        access_token, refresh_token = pair
+        response_obj = Response({"token": access_token}, status=200)
+        _set_access_cookie(response_obj, "super_admin", access_token)
+        _set_refresh_cookie(response_obj, "super_admin", refresh_token)
+        return response_obj
+
+
 class SuperAdminLogoutView(APIView):
     """POST /super-admin/logout/ — same auth-then-revoke shape as CustomerLogoutView /
     ShopStaffLogoutView, for consistency (revoking is a self-only action either way — a
@@ -430,8 +502,9 @@ class SuperAdminLogoutView(APIView):
         auth_header = request.headers.get("Authorization", "")
         token = auth_header.split(" ")[1].strip() if auth_header.startswith("Bearer ") else request.COOKIES.get("qp_super_admin_token", "")
         auth_handler.revoke_token(token)
+        auth_handler.revoke_refresh_family(request.COOKIES.get("qp_super_admin_refresh", ""))
         response_obj = Response({"message": "Logged out."}, status=200)
-        _clear_role_cookie(response_obj, "super_admin")
+        _clear_role_cookies(response_obj, "super_admin")
         return response_obj
 
 
@@ -555,10 +628,13 @@ class ShopStaffVerifyOTPView(APIView):
         if status_code == 200:
             try:
                 import json
-                decrypted = auth_handler.decrypt_data(result["encrypted_response"], result["iv"])
-                token = json.loads(decrypted).get("token")
+                decrypted = json.loads(auth_handler.decrypt_data(result["encrypted_response"], result["iv"]))
+                token = decrypted.get("token")
+                refresh_token = decrypted.get("refresh_token")
                 if token:
-                    _set_role_cookie(response_obj, "shop_staff", token)
+                    _set_access_cookie(response_obj, "shop_staff", token)
+                if refresh_token:
+                    _set_refresh_cookie(response_obj, "shop_staff", refresh_token)
             except Exception as e:
                 print(f"[COOKIE ERROR] Failed to set shop staff auth cookie: {e}")
         return response_obj
@@ -612,8 +688,9 @@ class ShopStaffLogoutView(APIView):
         auth_header = request.headers.get("Authorization", "")
         token = auth_header.split(" ")[1].strip() if auth_header.startswith("Bearer ") else request.COOKIES.get("qp_shop_token", "")
         auth_handler.revoke_token(token)
+        auth_handler.revoke_refresh_family(request.COOKIES.get("qp_shop_refresh", ""))
         response_obj = Response({"message": "Logged out."}, status=200)
-        _clear_role_cookie(response_obj, "shop_staff")
+        _clear_role_cookies(response_obj, "shop_staff")
         return response_obj
 
 
@@ -624,6 +701,25 @@ class ShopStaffMeView(APIView):
         if error_response:
             return error_response
         return Response(staff)
+
+
+class ShopStaffRefreshView(APIView):
+    """POST /shop-auth/refresh/ — same rotation pattern as CustomerRefreshView."""
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "auth"
+
+    def post(self, request):
+        raw_refresh = request.COOKIES.get("qp_shop_refresh") or request.data.get("refresh_token", "")
+        pair = auth_handler.refresh_access_token(raw_refresh, role="shop_staff")
+        if not pair:
+            response_obj = Response({"error": "Session expired. Please log in again."}, status=401)
+            _clear_role_cookies(response_obj, "shop_staff")
+            return response_obj
+        access_token, refresh_token = pair
+        response_obj = Response({"token": access_token}, status=200)
+        _set_access_cookie(response_obj, "shop_staff", access_token)
+        _set_refresh_cookie(response_obj, "shop_staff", refresh_token)
+        return response_obj
 
 
 # ── Shops ────────────────────────────────────────────────────────────────────────

@@ -36,17 +36,23 @@ if not JWT_SECRET:
     # trivially forgeable by anyone. Same fail-loud posture as khelomore-server.
     raise RuntimeError("JWT_SECRET environment variable is not set.")
 JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
-# Customer sessions: 30 days. Shop-staff sessions (control a real order queue) get a
-# shorter lifetime, same reasoning as khelomore-server's JWT_ADMIN_EXP_DELTA_SECONDS for
-# its cafe-owner/super-admin panels.
-# All three roles now share the same 24-hour session lifetime — the platform's most
-# sensitive login surfaces (shop-staff order queue, super admin) already had a short
-# lifetime; customer sessions previously stayed valid 30 days, which no longer matches
-# once every role goes through the same OTP-verified login (see below) — a session that
-# outlives its own re-verification cadence by 30x defeats the point of re-verifying at all.
-JWT_CUSTOMER_EXP_DELTA_SECONDS = int(os.getenv("JWT_CUSTOMER_EXP_DELTA_SECONDS", "86400"))
-JWT_SHOP_EXP_DELTA_SECONDS = int(os.getenv("JWT_SHOP_EXP_DELTA_SECONDS", "86400"))
-JWT_SUPER_ADMIN_EXP_DELTA_SECONDS = int(os.getenv("JWT_SUPER_ADMIN_EXP_DELTA_SECONDS", "86400"))
+
+# ── Access + refresh tokens ──────────────────────────────────────────────────────────
+# Standard two-token pattern (OWASP-recommended), replacing the single 24h JWT every
+# request used to carry directly. The ACCESS token is what's actually sent as
+# Authorization: Bearer on every API call — short-lived on purpose, so a leaked one is
+# only dangerous for a few minutes even if nobody notices. The REFRESH token is what
+# actually represents "the user stays logged in for 24h without re-entering credentials"
+# — it's opaque (not a JWT), stored server-side as a hash (same principle as OTP/password
+# storage: never keep the raw secret at rest), delivered only via an HttpOnly cookie
+# scoped to the refresh endpoint's own path (never sent on ordinary API calls, so it's
+# not exposed by the same XSS/log-leakage surface the access token is), and ROTATED on
+# every use: each refresh call revokes the token that was just spent and issues a new
+# one in its place. If an already-rotated (i.e. already-spent) refresh token is ever
+# presented again, that's a signal of theft — see revoke_refresh_family below — and the
+# whole session lineage is revoked defensively, not just that one token.
+ACCESS_TOKEN_EXP_SECONDS = int(os.getenv("ACCESS_TOKEN_EXP_SECONDS", "1800"))  # 30 min
+REFRESH_TOKEN_EXP_SECONDS = int(os.getenv("REFRESH_TOKEN_EXP_SECONDS", "86400"))  # 24h
 
 # ── OTP auth — AES-256-CBC field encryption, same security model as khelomore-server's
 # super_admin flow, now applied uniformly to ALL THREE roles (customer, shop_staff,
@@ -130,28 +136,24 @@ def verify_password(stored_hash: str, input_password: str) -> bool:
         return False
 
 
-def generate_token(email: str, role: str = "customer") -> str:
-    """role is 'customer', 'shop_staff', or 'super_admin' — determines session lifetime and
-    which collection callers should look the account up in (see get_user_collection)."""
-    if role == "shop_staff":
-        exp_seconds = JWT_SHOP_EXP_DELTA_SECONDS
-    elif role == "super_admin":
-        exp_seconds = JWT_SUPER_ADMIN_EXP_DELTA_SECONDS
-    else:
-        exp_seconds = JWT_CUSTOMER_EXP_DELTA_SECONDS
+def generate_access_token(email: str, role: str = "customer") -> str:
+    """Short-lived (ACCESS_TOKEN_EXP_SECONDS) JWT — this is what's actually sent as
+    Authorization: Bearer on every API call. role is 'customer', 'shop_staff', or
+    'super_admin' — determines which collection callers should look the account up in
+    (see get_user_collection)."""
     payload = {
         "email": email,
         "role": role,
         "jti": uuid.uuid4().hex,
-        "exp": datetime.now(IST) + timedelta(seconds=exp_seconds),
+        "exp": datetime.now(IST) + timedelta(seconds=ACCESS_TOKEN_EXP_SECONDS),
     }
     return jwt.encode(payload, JWT_SECRET, JWT_ALGORITHM)
 
 
 def revoke_token(token: str) -> None:
-    """Invalidates a token server-side (logout) so a leaked/stolen token stops working
-    immediately instead of remaining valid for its full lifetime. Safe to call with an
-    already-expired or malformed token (no-op) — mirrors khelomore-server exactly."""
+    """Invalidates an access token server-side (logout) so a leaked/stolen one stops
+    working immediately instead of remaining valid for its full lifetime. Safe to call
+    with an already-expired or malformed token (no-op) — mirrors khelomore-server exactly."""
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM], options={"verify_exp": False})
     except Exception:
@@ -174,9 +176,9 @@ def revoke_token(token: str) -> None:
 
 
 def verify_token(token: str) -> dict:
-    """Verifies JWT and returns {email, role} if valid, otherwise raises. A token with no
-    jti can never be revoked, so — same as khelomore-server — treat that as invalid
-    rather than unrevocable."""
+    """Verifies an access-token JWT and returns {email, role} if valid, otherwise raises.
+    A token with no jti can never be revoked, so — same as khelomore-server — treat that
+    as invalid rather than unrevocable."""
     payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
     jti = payload.get("jti")
     if not jti:
@@ -184,6 +186,95 @@ def verify_token(token: str) -> dict:
     if db_main.revoked_tokens.find_one({"jti": jti}):
         raise jwt.InvalidTokenError("Token has been revoked.")
     return {"email": payload["email"], "role": payload.get("role", "customer")}
+
+
+# ── Refresh tokens ────────────────────────────────────────────────────────────────────
+# Opaque (not a JWT) random tokens, stored server-side as a SHA-256 hash keyed by a
+# family_id — same "never store the raw secret" principle as OTPs and passwords. Every
+# refresh call rotates: the presented token is marked used, a new one is issued sharing
+# the same family_id. A family_id ties together every token that ever descended from one
+# original login, which is what makes reuse detection possible below.
+
+def _hash_refresh_token(raw_token: str) -> str:
+    import hashlib
+    return hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+
+
+def _issue_refresh_token(email: str, role: str, family_id: str = None) -> str:
+    """Creates a new refresh token doc and returns the RAW token (only ever returned
+    once, at issuance — never logged, never stored anywhere but this one response)."""
+    import secrets
+    raw_token = secrets.token_urlsafe(48)
+    family_id = family_id or uuid.uuid4().hex
+    db_main.refresh_tokens.create_index("expires_at", expireAfterSeconds=0)
+    db_main.refresh_tokens.insert_one({
+        "token_hash": _hash_refresh_token(raw_token),
+        "email": email,
+        "role": role,
+        "family_id": family_id,
+        "used": False,
+        "created_at": datetime.now(IST).isoformat(),
+        "expires_at": datetime.now(timezone.utc) + timedelta(seconds=REFRESH_TOKEN_EXP_SECONDS),
+    })
+    return raw_token
+
+
+def issue_token_pair(email: str, role: str) -> tuple[str, str]:
+    """Issues a fresh (access_token, refresh_token) pair for a brand-new session — called
+    at login/signup OTP verification and at Google sign-in. Returns (access, refresh)."""
+    return generate_access_token(email, role), _issue_refresh_token(email, role)
+
+
+def refresh_access_token(raw_refresh_token: str, role: str):
+    """
+    Validates + rotates a refresh token, returning a NEW (access_token, refresh_token)
+    pair on success. Returns None on any failure (expired, unknown, wrong role, or
+    already-used — in the already-used case this ALSO revokes every other token in that
+    same family, since presenting an already-rotated token is the standard signal that a
+    refresh token was stolen: the legitimate client and an attacker both tried to use the
+    same one, and whichever used it second is the tell).
+    """
+    if not raw_refresh_token:
+        return None
+    token_hash = _hash_refresh_token(raw_refresh_token)
+    doc = db_main.refresh_tokens.find_one({"token_hash": token_hash})
+    if not doc or doc.get("role") != role:
+        return None
+
+    expires_at = doc.get("expires_at")
+    if expires_at and expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if expires_at and datetime.now(timezone.utc) > expires_at:
+        return None
+
+    if doc.get("used"):
+        # SECURITY: reuse of an already-rotated refresh token — revoke the whole family.
+        db_main.refresh_tokens.update_many(
+            {"family_id": doc["family_id"]},
+            {"$set": {"used": True, "revoked_reason": "reuse_detected"}},
+        )
+        return None
+
+    db_main.refresh_tokens.update_one({"_id": doc["_id"]}, {"$set": {"used": True}})
+    new_refresh = _issue_refresh_token(doc["email"], doc["role"], family_id=doc["family_id"])
+    new_access = generate_access_token(doc["email"], doc["role"])
+    return new_access, new_refresh
+
+
+def revoke_refresh_family(raw_refresh_token: str) -> None:
+    """Revokes every token descended from the same login as raw_refresh_token — called on
+    logout, so a stolen-but-not-yet-used refresh token from that session stops working
+    immediately too, not just the current access token. Safe to call with an unknown or
+    malformed token (no-op)."""
+    if not raw_refresh_token:
+        return
+    doc = db_main.refresh_tokens.find_one({"token_hash": _hash_refresh_token(raw_refresh_token)})
+    if not doc:
+        return
+    db_main.refresh_tokens.update_many(
+        {"family_id": doc["family_id"]},
+        {"$set": {"used": True, "revoked_reason": "logout"}},
+    )
 
 
 def get_user_collection(role: str):
@@ -367,9 +458,10 @@ def verify_otp(email_enc, otp_enc, iv, role: str):
         update_fields["$set"] = {"status": "Active"}
     coll.update_one({"_id": user["_id"]}, update_fields)
 
-    token = generate_token(dec_email, role=role)
+    access_token, refresh_token = issue_token_pair(dec_email, role)
     response_data = {
-        "token": token,
+        "token": access_token,
+        "refresh_token": refresh_token,
         "message": "Verification successful",
         "user": _build_user_response(role, user),
     }
@@ -554,8 +646,13 @@ def _get_or_create_google_user(idinfo: dict):
             db_main.users.update_one({"_id": user["_id"]}, {"$set": {"google_id": google_id}})
         user_id = str(user["_id"])
 
-    token = generate_token(dec_email, role="customer")
-    return {"status": 200, "token": token, "user": {"id": user_id, "email": dec_email, "name": name}}, None
+    access_token, refresh_token = issue_token_pair(dec_email, "customer")
+    return {
+        "status": 200,
+        "token": access_token,
+        "refresh_token": refresh_token,
+        "user": {"id": user_id, "email": dec_email, "name": name},
+    }, None
 
 
 def google_login_customer_via_code(code: str, redirect_uri: str):

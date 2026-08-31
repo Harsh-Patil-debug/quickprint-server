@@ -23,6 +23,7 @@ urlpatterns = [
     path('auth/google/callback/', CustomerGoogleCallbackView.as_view(), name='customer_google_callback'),
     path('auth/logout/', CustomerLogoutView.as_view(), name='customer_logout'),
     path('auth/me/', CustomerMeView.as_view(), name='customer_me'),
+    path('auth/refresh/', CustomerRefreshView.as_view(), name='customer_refresh'),
 
     # ── Super admin auth ─────────────────────────────────────────────────────
     path('super-admin/register/', SuperAdminRegisterView.as_view(), name='super_admin_register'),
@@ -33,6 +34,7 @@ urlpatterns = [
     path('super-admin/reset-password/', SuperAdminResetPasswordView.as_view(), name='super_admin_reset_password'),
     path('super-admin/logout/', SuperAdminLogoutView.as_view(), name='super_admin_logout'),
     path('super-admin/me/', SuperAdminMeView.as_view(), name='super_admin_me'),
+    path('super-admin/refresh/', SuperAdminRefreshView.as_view(), name='super_admin_refresh'),
 
     # ── Partner applications ─────────────────────────────────────────────────
     path('partner-applications/', PartnerApplicationListCreateView.as_view(), name='partner_applications'),
@@ -48,6 +50,7 @@ urlpatterns = [
     path('shop-auth/reset-password/', ShopStaffResetPasswordView.as_view(), name='shop_staff_reset_password'),
     path('shop-auth/logout/', ShopStaffLogoutView.as_view(), name='shop_staff_logout'),
     path('shop-auth/me/', ShopStaffMeView.as_view(), name='shop_staff_me'),
+    path('shop-auth/refresh/', ShopStaffRefreshView.as_view(), name='shop_staff_refresh'),
 
     # ── Shops ─────────────────────────────────────────────────────────────────
     path('shops/', ShopListView.as_view(), name='shops'),
