@@ -77,6 +77,20 @@ def _clear_role_cookies(response, role: str):
     response.delete_cookie(ROLE_REFRESH_COOKIE_NAMES[role], samesite="None", path=ROLE_REFRESH_PATHS[role])
 
 
+def _get_body_str_field(request, field_name: str) -> str:
+    """Safely reads a string field out of request.data — DRF's parsed body isn't always a
+    dict: a client can POST a bare JSON string, list, or number as the entire body (still
+    valid JSON), which makes request.data a str/list/whatever instead. Calling .get() on
+    that directly raises AttributeError (an unhandled 500) rather than the clean rejection
+    a malformed request should get. Also guards against the field itself being present but
+    of the wrong type (e.g. refresh_token: [1,2,3]) — downstream code expects a string."""
+    data = request.data
+    if not isinstance(data, dict):
+        return ""
+    value = data.get(field_name, "")
+    return value if isinstance(value, str) else ""
+
+
 def _is_allowed_oauth_redirect_target(target: str) -> bool:
     """
     SECURITY: `return_url`/`state` is unauthenticated, attacker-influenceable input that
@@ -321,7 +335,7 @@ class CustomerRefreshView(APIView):
     throttle_scope = "auth"
 
     def post(self, request):
-        raw_refresh = request.COOKIES.get("qp_customer_refresh") or request.data.get("refresh_token", "")
+        raw_refresh = request.COOKIES.get("qp_customer_refresh") or _get_body_str_field(request, "refresh_token")
         pair = auth_handler.refresh_access_token(raw_refresh, role="customer")
         if not pair:
             response_obj = Response({"error": "Session expired. Please log in again."}, status=401)
@@ -477,7 +491,7 @@ class SuperAdminRefreshView(APIView):
     throttle_scope = "auth"
 
     def post(self, request):
-        raw_refresh = request.COOKIES.get("qp_super_admin_refresh") or request.data.get("refresh_token", "")
+        raw_refresh = request.COOKIES.get("qp_super_admin_refresh") or _get_body_str_field(request, "refresh_token")
         pair = auth_handler.refresh_access_token(raw_refresh, role="super_admin")
         if not pair:
             response_obj = Response({"error": "Session expired. Please log in again."}, status=401)
@@ -709,7 +723,7 @@ class ShopStaffRefreshView(APIView):
     throttle_scope = "auth"
 
     def post(self, request):
-        raw_refresh = request.COOKIES.get("qp_shop_refresh") or request.data.get("refresh_token", "")
+        raw_refresh = request.COOKIES.get("qp_shop_refresh") or _get_body_str_field(request, "refresh_token")
         pair = auth_handler.refresh_access_token(raw_refresh, role="shop_staff")
         if not pair:
             response_obj = Response({"error": "Session expired. Please log in again."}, status=401)

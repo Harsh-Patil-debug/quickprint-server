@@ -228,34 +228,48 @@ def issue_token_pair(email: str, role: str) -> tuple[str, str]:
 def refresh_access_token(raw_refresh_token: str, role: str):
     """
     Validates + rotates a refresh token, returning a NEW (access_token, refresh_token)
-    pair on success. Returns None on any failure (expired, unknown, wrong role, or
-    already-used — in the already-used case this ALSO revokes every other token in that
-    same family, since presenting an already-rotated token is the standard signal that a
-    refresh token was stolen: the legitimate client and an attacker both tried to use the
-    same one, and whichever used it second is the tell).
+    pair on success. Returns None on any failure (wrong type, expired, unknown, wrong
+    role, or already-used — in the already-used case this ALSO revokes every other token
+    in that same family, since presenting an already-rotated token is the standard signal
+    that a refresh token was stolen: the legitimate client and an attacker both tried to
+    use the same one, and whichever used it second is the tell).
+
+    SECURITY/ROBUSTNESS: the "claim" (mark used) is a single atomic find_one_and_update,
+    not a separate find_one + update_one — the two-step version had a genuine TOCTOU race
+    where two near-simultaneous refresh calls could both read used=False before either
+    write landed, both proceed to rotate, and neither trip reuse-detection. The role check
+    is folded into the same atomic filter so a client can never burn a token that doesn't
+    even belong to it.
     """
-    if not raw_refresh_token:
+    if not raw_refresh_token or not isinstance(raw_refresh_token, str):
         return None
     token_hash = _hash_refresh_token(raw_refresh_token)
-    doc = db_main.refresh_tokens.find_one({"token_hash": token_hash})
-    if not doc or doc.get("role") != role:
+
+    doc = db_main.refresh_tokens.find_one_and_update(
+        {"token_hash": token_hash, "role": role, "used": False},
+        {"$set": {"used": True}},
+    )
+    if doc is None:
+        existing = db_main.refresh_tokens.find_one({"token_hash": token_hash})
+        if not existing or existing.get("role") != role:
+            return None
+        if existing.get("used"):
+            # SECURITY: reuse of an already-rotated refresh token — revoke the whole family.
+            db_main.refresh_tokens.update_many(
+                {"family_id": existing["family_id"]},
+                {"$set": {"used": True, "revoked_reason": "reuse_detected"}},
+            )
         return None
 
     expires_at = doc.get("expires_at")
     if expires_at and expires_at.tzinfo is None:
         expires_at = expires_at.replace(tzinfo=timezone.utc)
     if expires_at and datetime.now(timezone.utc) > expires_at:
+        # Already claimed above (burned) — an expired token can never be validly reused
+        # regardless, and this keeps a second presentation of it consistent (it'll now
+        # correctly read as "already used" rather than "still expired-but-unclaimed").
         return None
 
-    if doc.get("used"):
-        # SECURITY: reuse of an already-rotated refresh token — revoke the whole family.
-        db_main.refresh_tokens.update_many(
-            {"family_id": doc["family_id"]},
-            {"$set": {"used": True, "revoked_reason": "reuse_detected"}},
-        )
-        return None
-
-    db_main.refresh_tokens.update_one({"_id": doc["_id"]}, {"$set": {"used": True}})
     new_refresh = _issue_refresh_token(doc["email"], doc["role"], family_id=doc["family_id"])
     new_access = generate_access_token(doc["email"], doc["role"])
     return new_access, new_refresh
@@ -264,9 +278,9 @@ def refresh_access_token(raw_refresh_token: str, role: str):
 def revoke_refresh_family(raw_refresh_token: str) -> None:
     """Revokes every token descended from the same login as raw_refresh_token — called on
     logout, so a stolen-but-not-yet-used refresh token from that session stops working
-    immediately too, not just the current access token. Safe to call with an unknown or
-    malformed token (no-op)."""
-    if not raw_refresh_token:
+    immediately too, not just the current access token. Safe to call with an unknown,
+    malformed, or wrong-type token (no-op)."""
+    if not raw_refresh_token or not isinstance(raw_refresh_token, str):
         return
     doc = db_main.refresh_tokens.find_one({"token_hash": _hash_refresh_token(raw_refresh_token)})
     if not doc:
