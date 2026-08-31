@@ -322,9 +322,16 @@ class PartnerApplicationDetailView(APIView):
 # ── Shop staff auth ─────────────────────────────────────────────────────────────
 
 class ShopStaffRegisterView(APIView):
-    """POST /shop-auth/register/ — admin-provisioned only. Body: { email, password, name, shop_id, role }"""
+    """POST /shop-auth/register/ — super-admin-provisioned only. Body: { email, password, name, shop_id, role }.
+    Uses authenticate_super_admin_request (static ADMIN_TOKEN OR a real super_admin
+    session), matching every other admin-surface endpoint — previously this was the one
+    endpoint still gated on the static token alone, which meant a logged-in super admin
+    (as opposed to whoever holds the raw secret) couldn't use it."""
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "auth"
+
     def post(self, request):
-        is_admin, error_response = auth_middleware.authenticate_admin_request(request)
+        _, error_response = auth_middleware.authenticate_super_admin_request(request)
         if error_response:
             return error_response
         data = request.data
