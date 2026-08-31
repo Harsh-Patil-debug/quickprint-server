@@ -15,6 +15,10 @@ urlpatterns = [
     # ── Customer auth ────────────────────────────────────────────────────────
     path('auth/register/', CustomerRegisterView.as_view(), name='customer_register'),
     path('auth/login/', CustomerLoginView.as_view(), name='customer_login'),
+    path('auth/verify-otp/', CustomerVerifyOTPView.as_view(), name='customer_verify_otp'),
+    path('auth/resend-otp/', CustomerResendOTPView.as_view(), name='customer_resend_otp'),
+    path('auth/forgot-password/', CustomerForgotPasswordView.as_view(), name='customer_forgot_password'),
+    path('auth/reset-password/', CustomerResetPasswordView.as_view(), name='customer_reset_password'),
     path('auth/google/login/', CustomerGoogleLoginRedirectView.as_view(), name='customer_google_login'),
     path('auth/google/callback/', CustomerGoogleCallbackView.as_view(), name='customer_google_callback'),
     path('auth/logout/', CustomerLogoutView.as_view(), name='customer_logout'),
@@ -25,6 +29,8 @@ urlpatterns = [
     path('super-admin/login/', SuperAdminLoginView.as_view(), name='super_admin_login'),
     path('super-admin/verify-otp/', SuperAdminVerifyOTPView.as_view(), name='super_admin_verify_otp'),
     path('super-admin/resend-otp/', SuperAdminResendOTPView.as_view(), name='super_admin_resend_otp'),
+    path('super-admin/forgot-password/', SuperAdminForgotPasswordView.as_view(), name='super_admin_forgot_password'),
+    path('super-admin/reset-password/', SuperAdminResetPasswordView.as_view(), name='super_admin_reset_password'),
     path('super-admin/logout/', SuperAdminLogoutView.as_view(), name='super_admin_logout'),
     path('super-admin/me/', SuperAdminMeView.as_view(), name='super_admin_me'),
 
@@ -36,6 +42,10 @@ urlpatterns = [
     path('shop-auth/register/', ShopStaffRegisterView.as_view(), name='shop_staff_register'),
     path('shop-auth/signup/', ShopOwnerSignupView.as_view(), name='shop_owner_signup'),
     path('shop-auth/login/', ShopStaffLoginView.as_view(), name='shop_staff_login'),
+    path('shop-auth/verify-otp/', ShopStaffVerifyOTPView.as_view(), name='shop_staff_verify_otp'),
+    path('shop-auth/resend-otp/', ShopStaffResendOTPView.as_view(), name='shop_staff_resend_otp'),
+    path('shop-auth/forgot-password/', ShopStaffForgotPasswordView.as_view(), name='shop_staff_forgot_password'),
+    path('shop-auth/reset-password/', ShopStaffResetPasswordView.as_view(), name='shop_staff_reset_password'),
     path('shop-auth/logout/', ShopStaffLogoutView.as_view(), name='shop_staff_logout'),
     path('shop-auth/me/', ShopStaffMeView.as_view(), name='shop_staff_me'),
 

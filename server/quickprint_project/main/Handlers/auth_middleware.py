@@ -1,8 +1,10 @@
 # auth_middleware.py
-# Mirrors khelomore-server/.../Handlers/auth_middleware.py's shape exactly, simplified
-# for QuickPrint's Bearer-only auth (no cookie fallback — see middleware.py's note on
-# why) and two-role model (customer / shop_staff, distinguished by the JWT's own "role"
-# claim from auth_handler.generate_token, not by which cookie arrived).
+# Mirrors khelomore-server/.../Handlers/auth_middleware.py's shape exactly, including its
+# cookie fallback: an Authorization: Bearer header is tried first, falling back to this
+# role's own HttpOnly cookie (set at verify_otp time — see views.py) if there's no header.
+# The cookie fallback matters for browser requests where a page load can't easily attach a
+# custom header (e.g. a plain <a>/<form> navigation) and keeps sessions alive for visitors
+# whose browser blocks localStorage in some contexts but not first-party cookies.
 
 import hmac
 from django.conf import settings
@@ -11,19 +13,21 @@ from rest_framework import status
 from . import auth_handler
 
 
-def _extract_bearer_token(request):
+def _extract_token(request, cookie_name: str = None):
     auth_header = request.headers.get("Authorization")
     if auth_header and auth_header.startswith("Bearer "):
         return auth_header.split(" ")[1].strip()
+    if cookie_name:
+        return request.COOKIES.get(cookie_name)
     return None
 
 
 def authenticate_customer_request(request):
     """
-    Validates the Bearer token and requires role == 'customer'.
-    Returns (email, None) if successful. Returns (None, Response) if validation fails.
+    Validates the Bearer token (or qp_customer_token cookie) and requires role ==
+    'customer'. Returns (email, None) if successful. Returns (None, Response) if not.
     """
-    token = _extract_bearer_token(request)
+    token = _extract_token(request, "qp_customer_token")
     if not token:
         return None, Response({"error": "Authorization token missing or invalid"}, status=status.HTTP_401_UNAUTHORIZED)
     try:
@@ -43,7 +47,7 @@ def authenticate_shop_staff_request(request):
     order queue.
     Returns ({email, shop_id}, None) if successful. Returns (None, Response) if not.
     """
-    token = _extract_bearer_token(request)
+    token = _extract_token(request, "qp_shop_token")
     if not token:
         return None, Response({"error": "Authorization token missing or invalid"}, status=status.HTTP_401_UNAUTHORIZED)
     try:
@@ -87,7 +91,7 @@ def authenticate_super_admin_request(request):
     identifier is "super_admin_static" for the static-token path, or the admin's own email
     for a real session — or (None, Response) on failure.
     """
-    token = _extract_bearer_token(request)
+    token = _extract_token(request, "qp_super_admin_token")
     if not token:
         return None, Response({"error": "Authorization token missing or invalid"}, status=status.HTTP_401_UNAUTHORIZED)
 

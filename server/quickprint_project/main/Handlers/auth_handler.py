@@ -39,25 +39,39 @@ JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
 # Customer sessions: 30 days. Shop-staff sessions (control a real order queue) get a
 # shorter lifetime, same reasoning as khelomore-server's JWT_ADMIN_EXP_DELTA_SECONDS for
 # its cafe-owner/super-admin panels.
-JWT_CUSTOMER_EXP_DELTA_SECONDS = int(os.getenv("JWT_CUSTOMER_EXP_DELTA_SECONDS", "2592000"))
+# All three roles now share the same 24-hour session lifetime — the platform's most
+# sensitive login surfaces (shop-staff order queue, super admin) already had a short
+# lifetime; customer sessions previously stayed valid 30 days, which no longer matches
+# once every role goes through the same OTP-verified login (see below) — a session that
+# outlives its own re-verification cadence by 30x defeats the point of re-verifying at all.
+JWT_CUSTOMER_EXP_DELTA_SECONDS = int(os.getenv("JWT_CUSTOMER_EXP_DELTA_SECONDS", "86400"))
 JWT_SHOP_EXP_DELTA_SECONDS = int(os.getenv("JWT_SHOP_EXP_DELTA_SECONDS", "86400"))
-# Super admin sessions get the same short lifetime as shop-staff — the platform's most
-# sensitive login surface shouldn't stay valid for 30 days like a customer session.
 JWT_SUPER_ADMIN_EXP_DELTA_SECONDS = int(os.getenv("JWT_SUPER_ADMIN_EXP_DELTA_SECONDS", "86400"))
 
-# ── Super admin OTP auth — AES-256-CBC field encryption, same security model as
-# khelomore-server's super_admin flow (see that file's own ENCRYPTION_KEY/encrypt_data/
-# decrypt_data/hash_otp for the exact pattern this ports). Only the super_admin auth
-# surface uses this — customer/shop_staff auth deliberately stays plain email+password
-# (see the module docstring above for why that was a prior, separate decision).
+# ── OTP auth — AES-256-CBC field encryption, same security model as khelomore-server's
+# super_admin flow, now applied uniformly to ALL THREE roles (customer, shop_staff,
+# super_admin): every traditional (non-Google) login and every self-service signup is a
+# two-step email+password -> OTP -> JWT flow, exactly like khelomore-server's own
+# bookmyconsole_register/bookmyconsole_login/bookmyconsole_verify_otp/
+# bookmyconsole_forgot_password/bookmyconsole_reset_password (see those for the pattern
+# every function below ports). Google sign-in skips OTP for the same reason
+# khelomore-server's does — Google has already verified that identity.
 ENCRYPTION_KEY = base64.b64decode(os.getenv("ENCRYPTION_KEY", ""))
 if not ENCRYPTION_KEY:
     raise RuntimeError("ENCRYPTION_KEY environment variable is not set.")
+OTP_EXPIRY_MINUTES = int(os.getenv("OTP_EXPIRY_MINUTES", "10"))
+# Super admin's is the platform's most sensitive login surface — a valid code shouldn't
+# sit in an inbox as long as a customer's.
 SUPER_ADMIN_OTP_EXPIRY_MINUTES = int(os.getenv("SUPER_ADMIN_OTP_EXPIRY_MINUTES", "2"))
 MAX_OTP_ATTEMPTS = int(os.getenv("MAX_OTP_ATTEMPTS", "5"))
+MAX_PASSWORD_RESET_ATTEMPTS = MAX_OTP_ATTEMPTS
 MAX_LOGIN_ATTEMPTS = int(os.getenv("MAX_LOGIN_ATTEMPTS", "5"))
 LOGIN_LOCKOUT_MINUTES = int(os.getenv("LOGIN_LOCKOUT_MINUTES", "15"))
 OTP_RESEND_COOLDOWN_SECONDS = int(os.getenv("OTP_RESEND_COOLDOWN_SECONDS", "45"))
+
+
+def _otp_expiry_minutes(role: str) -> int:
+    return SUPER_ADMIN_OTP_EXPIRY_MINUTES if role == "super_admin" else OTP_EXPIRY_MINUTES
 
 
 def encrypt_data(plain_text: str, key: bytes = None):
@@ -180,50 +194,336 @@ def get_user_collection(role: str):
     return db_main.users
 
 
-def register_customer(email: str, password: str, name: str = ""):
-    """Email+password signup. No OTP — the user is Active immediately, matching the
-    email+password/Google auth choice (OTP verification wasn't asked for here)."""
-    dec_email = (email or "").strip().lower()
-    error = input_validation.validate_email(dec_email) or input_validation.validate_password_strength(password)
+# ── Unified OTP auth — register / login / verify_otp / resend_otp / forgot / reset ──────
+# One implementation shared by customer, shop_staff (self-service owner signup only —
+# admin-direct provisioning is register_shop_staff below, a different trust model), and
+# super_admin. Ported from khelomore-server's own bookmyconsole_register/_login/
+# _verify_otp/_forgot_password/_reset_password, which are themselves role-parameterized
+# the same way.
+
+def _build_user_response(role: str, doc: dict) -> dict:
+    """Shapes the {user: {...}} part of a verify_otp response — shop_staff carries
+    shop_id/role fields the other two don't need."""
+    base = {"id": str(doc["_id"]), "email": doc["email"], "name": doc.get("name", "")}
+    if role == "shop_staff":
+        base["shop_id"] = doc.get("shop_id")
+        base["role"] = doc.get("role", "staff")
+    else:
+        base["role"] = role
+    return base
+
+
+def register(name_enc, email_enc, password_enc, iv, role: str):
+    """Step 1 of signup — creates a Pending account doc, emails an OTP, no JWT yet.
+    role='shop_staff' here is ALWAYS the public self-service owner-signup path (mirrors
+    register_shop_owner's old behaviour): the email must already be listed as a shop's
+    owner_email, set by the super admin via 'Add Print Shop' — same authorization-by-
+    email-match as khelomore-server's is_cafe_owner_signup branch. Admin-direct shop
+    staff provisioning (no self-verification needed, the admin already vouches for them)
+    stays in register_shop_staff, a separate function with no OTP step."""
+    try:
+        dec_name = decrypt_data(name_enc, iv).strip()
+        dec_email = decrypt_data(email_enc, iv).strip().lower()
+        dec_password = decrypt_data(password_enc, iv)
+    except Exception as e:
+        return {"error": f"Decryption failed: {str(e)}"}, 400
+
+    error = (
+        input_validation.validate_text(dec_name, "Name", max_len=80)
+        or input_validation.validate_email(dec_email)
+        or input_validation.validate_password_strength(dec_password)
+    )
     if error:
-        return {"status": 400, "error": error}
+        return {"error": error}, 400
 
-    if db_main.users.find_one({"email": dec_email}):
-        return {"status": 409, "error": "An account with this email already exists."}
+    coll = get_user_collection(role)
+    shop = None
+    if role == "shop_staff":
+        shop = db_main.shops.find_one({"owner_email": dec_email, "is_active": {"$ne": False}})
+        if not shop:
+            return {"error": "This email is not authorized. Please contact the platform Super Admin to list your shop first."}, 403
 
+    if coll.find_one({"email": dec_email}):
+        return {"error": "An account with this email already exists."}, 400
+
+    otp_code = str(random.randint(100000, 999999))
+    otp_expiry = datetime.now(IST) + timedelta(minutes=_otp_expiry_minutes(role))
     doc = {
+        "name": dec_name,
         "email": dec_email,
-        "name": name.strip() if name else dec_email.split("@")[0],
-        "password_hash": hash_password(password),
-        "google_id": None,
-        "status": "Active",
+        "password_hash": ph.hash(dec_password),
+        "status": "Pending",
+        "otp_code": hash_otp(otp_code),
+        "otp_expiry": otp_expiry,
+        "role": "owner" if role == "shop_staff" else role,
         "created_at": datetime.now(IST).isoformat(),
     }
-    result = db_main.users.insert_one(doc)
-    token = generate_token(dec_email, role="customer")
-    return {
-        "status": 201,
-        "token": token,
-        "user": {"id": str(result.inserted_id), "email": dec_email, "name": doc["name"]},
-    }
+    if role == "customer":
+        doc["google_id"] = None
+    if role == "shop_staff":
+        doc["shop_id"] = str(shop["_id"])
+        if not dec_name:
+            doc["name"] = shop.get("owner_name") or dec_email.split("@")[0]
+
+    coll.insert_one(doc)
+
+    from .email_handler import send_otp_email
+    send_otp_email(dec_email, otp_code, name=doc["name"] or dec_email.split("@")[0], purpose="signup")
+
+    response_json = json.dumps({"message": "OTP sent to your email.", "email": dec_email})
+    enc_resp, iv2 = encrypt_data(response_json)
+    return {"encrypted_response": enc_resp, "iv": iv2}, 200
 
 
-def login_customer(email: str, password: str):
-    dec_email = (email or "").strip().lower()
-    user = db_main.users.find_one({"email": dec_email})
+def login(email_enc, password_enc, iv, role: str):
+    """Step 1 of login — verifies credentials, emails an OTP, no JWT yet."""
+    try:
+        dec_email = decrypt_data(email_enc, iv).strip().lower()
+        dec_password = decrypt_data(password_enc, iv)
+    except Exception as e:
+        return {"error": f"Decryption failed: {str(e)}"}, 400
+
+    coll = get_user_collection(role)
+    user = coll.find_one({"email": dec_email})
     if not user or not user.get("password_hash"):
-        return {"status": 401, "error": "Invalid email or password."}
-    if user.get("status") != "Active":
-        return {"status": 403, "error": "This account is not active."}
-    if not verify_password(user["password_hash"], password):
-        return {"status": 401, "error": "Invalid email or password."}
+        return {"error": "Invalid email or password."}, 401
+    if user.get("status") in ("Blocked", "Suspended"):
+        return {"error": "This account has been suspended. Please contact support."}, 403
 
-    token = generate_token(dec_email, role="customer")
-    return {
-        "status": 200,
+    # SECURITY: bound password-guessing against a known email.
+    locked_until = user.get("login_locked_until")
+    if locked_until:
+        if locked_until.tzinfo is None:
+            locked_until = locked_until.replace(tzinfo=timezone.utc).astimezone(IST)
+        if datetime.now(IST) < locked_until:
+            return {"error": "Too many failed login attempts. Please try again later."}, 429
+
+    if not verify_password(user["password_hash"], dec_password):
+        attempts = int(user.get("login_attempts", 0)) + 1
+        update_fields = {"login_attempts": attempts}
+        if attempts >= MAX_LOGIN_ATTEMPTS:
+            update_fields["login_locked_until"] = datetime.now(IST) + timedelta(minutes=LOGIN_LOCKOUT_MINUTES)
+        coll.update_one({"_id": user["_id"]}, {"$set": update_fields})
+        return {"error": "Invalid email or password."}, 401
+
+    if user.get("login_attempts") or user.get("login_locked_until"):
+        coll.update_one({"_id": user["_id"]}, {"$unset": {"login_attempts": "", "login_locked_until": ""}})
+
+    otp_code = str(random.randint(100000, 999999))
+    otp_expiry = datetime.now(IST) + timedelta(minutes=_otp_expiry_minutes(role))
+    coll.update_one(
+        {"_id": user["_id"]},
+        {"$set": {"otp_code": hash_otp(otp_code), "otp_expiry": otp_expiry}, "$unset": {"otp_attempts": ""}},
+    )
+
+    from .email_handler import send_otp_email
+    send_otp_email(dec_email, otp_code, name=user.get("name", "User"), purpose="login")
+
+    response_json = json.dumps({"message": "OTP sent to your email.", "email": dec_email})
+    enc_resp, iv2 = encrypt_data(response_json)
+    return {"encrypted_response": enc_resp, "iv": iv2}, 200
+
+
+def verify_otp(email_enc, otp_enc, iv, role: str):
+    """Step 2 (login + signup) — validates the OTP, activates the account, issues a JWT."""
+    try:
+        dec_email = decrypt_data(email_enc, iv).strip().lower()
+        dec_otp = decrypt_data(otp_enc, iv).strip()
+    except Exception as e:
+        return {"error": f"Decryption failed: {str(e)}"}, 400
+
+    coll = get_user_collection(role)
+    user = coll.find_one({"email": dec_email})
+    if not user:
+        return {"error": "Session not found. Please start again."}, 404
+    if user.get("status") in ("Blocked", "Suspended"):
+        return {"error": "This account has been suspended. Please contact support."}, 403
+
+    stored_otp = user.get("otp_code")
+    otp_exp = user.get("otp_expiry")
+    if not stored_otp or not otp_exp:
+        return {"error": "No OTP request found."}, 400
+    if otp_exp.tzinfo is None:
+        otp_exp = otp_exp.replace(tzinfo=timezone.utc).astimezone(IST)
+    if datetime.now(IST) > otp_exp:
+        return {"error": "OTP has expired. Please request a new code."}, 400
+
+    if not verify_otp_hash(stored_otp, dec_otp):
+        # SECURITY: bound OTP guessing — a 6-digit code has 1,000,000 possibilities, so
+        # unlimited attempts would make it brute-forceable.
+        attempts = int(user.get("otp_attempts", 0)) + 1
+        if attempts >= MAX_OTP_ATTEMPTS:
+            coll.update_one(
+                {"_id": user["_id"]},
+                {"$unset": {"otp_code": "", "otp_expiry": "", "otp_attempts": ""}},
+            )
+            return {"error": "Too many incorrect attempts. Please request a new code."}, 429
+        coll.update_one({"_id": user["_id"]}, {"$set": {"otp_attempts": attempts}})
+        return {"error": "Invalid verification code."}, 400
+
+    is_new = user.get("status") == "Pending"
+    update_fields = {"$unset": {"otp_code": "", "otp_expiry": "", "otp_attempts": ""}}
+    if is_new:
+        update_fields["$set"] = {"status": "Active"}
+    coll.update_one({"_id": user["_id"]}, update_fields)
+
+    token = generate_token(dec_email, role=role)
+    response_data = {
         "token": token,
-        "user": {"id": str(user["_id"]), "email": dec_email, "name": user.get("name", "")},
+        "message": "Verification successful",
+        "user": _build_user_response(role, user),
     }
+    enc_resp, iv2 = encrypt_data(json.dumps(response_data))
+    return {"encrypted_response": enc_resp, "iv": iv2}, 200
+
+
+def resend_otp(email_enc, iv, role: str):
+    """Re-generates and re-sends the OTP for an existing account (404s if none exists —
+    this can only ever re-send for an account, never create or promote one)."""
+    try:
+        dec_email = decrypt_data(email_enc, iv).strip().lower()
+    except Exception as e:
+        return {"error": f"Decryption failed: {str(e)}"}, 400
+
+    coll = get_user_collection(role)
+    user = coll.find_one({"email": dec_email})
+    if not user:
+        return {"error": "No account found for this email."}, 404
+
+    # SECURITY: cooldown so resending can't be used to dodge the OTP-attempt lockout by
+    # requesting a fresh code just before hitting the attempt cap.
+    prev_expiry = user.get("otp_expiry")
+    if prev_expiry:
+        if prev_expiry.tzinfo is None:
+            prev_expiry = prev_expiry.replace(tzinfo=timezone.utc).astimezone(IST)
+        last_sent = prev_expiry - timedelta(minutes=_otp_expiry_minutes(role))
+        elapsed = (datetime.now(IST) - last_sent).total_seconds()
+        if elapsed < OTP_RESEND_COOLDOWN_SECONDS:
+            wait_for = int(OTP_RESEND_COOLDOWN_SECONDS - elapsed)
+            return {"error": f"Please wait {wait_for}s before requesting another code."}, 429
+
+    otp_code = str(random.randint(100000, 999999))
+    otp_expiry = datetime.now(IST) + timedelta(minutes=_otp_expiry_minutes(role))
+    coll.update_one(
+        {"_id": user["_id"]},
+        {"$set": {"otp_code": hash_otp(otp_code), "otp_expiry": otp_expiry}, "$unset": {"otp_attempts": ""}},
+    )
+
+    from .email_handler import send_otp_email
+    send_otp_email(dec_email, otp_code, name=user.get("name", "User"), purpose="resend")
+
+    enc_resp, iv2 = encrypt_data('{"message": "New OTP sent to your email."}')
+    return {"encrypted_response": enc_resp, "iv": iv2}, 200
+
+
+def forgot_password(email_enc, iv, role: str):
+    """
+    Step 1 of password reset: if an account exists for this email, emails it a reset OTP.
+
+    SECURITY: always returns the same generic message regardless of whether the account
+    exists, is Google-only (no password to reset), or is suspended — revealing any of
+    that would let an attacker enumerate registered emails. Only the actual reset step
+    needs the OTP to have genuinely been sent, which it silently isn't for any of those
+    cases. Mirrors khelomore-server's bookmyconsole_forgot_password exactly.
+    """
+    try:
+        dec_email = decrypt_data(email_enc, iv).strip().lower()
+    except Exception as e:
+        return {"error": f"Decryption failed: {str(e)}"}, 400
+
+    error = input_validation.validate_email(dec_email)
+    if error:
+        return {"error": error}, 400
+
+    generic_message = {"message": "If an account exists for this email, a password reset code has been sent."}
+
+    def _respond():
+        enc_resp, iv2 = encrypt_data(json.dumps(generic_message))
+        return {"encrypted_response": enc_resp, "iv": iv2}, 200
+
+    coll = get_user_collection(role)
+    user = coll.find_one({"email": dec_email})
+    if not user or user.get("status") in ("Blocked", "Suspended") or not user.get("password_hash"):
+        return _respond()
+
+    prev_expiry = user.get("reset_otp_expiry")
+    if prev_expiry:
+        if prev_expiry.tzinfo is None:
+            prev_expiry = prev_expiry.replace(tzinfo=timezone.utc).astimezone(IST)
+        last_sent = prev_expiry - timedelta(minutes=_otp_expiry_minutes(role))
+        elapsed = (datetime.now(IST) - last_sent).total_seconds()
+        if elapsed < OTP_RESEND_COOLDOWN_SECONDS:
+            return _respond()
+
+    otp_code = str(random.randint(100000, 999999))
+    otp_expiry = datetime.now(IST) + timedelta(minutes=_otp_expiry_minutes(role))
+    coll.update_one(
+        {"_id": user["_id"]},
+        {"$set": {"reset_otp_code": hash_otp(otp_code), "reset_otp_expiry": otp_expiry},
+         "$unset": {"reset_otp_attempts": ""}},
+    )
+
+    from .email_handler import send_otp_email
+    send_otp_email(dec_email, otp_code, name=user.get("name", "User"), purpose="password_reset")
+
+    return _respond()
+
+
+def reset_password(email_enc, otp_enc, new_password_enc, iv, role: str):
+    """Step 2 of password reset: verify the reset OTP and set a new password."""
+    try:
+        dec_email = decrypt_data(email_enc, iv).strip().lower()
+        dec_otp = decrypt_data(otp_enc, iv).strip()
+        dec_new_password = decrypt_data(new_password_enc, iv)
+    except Exception as e:
+        return {"error": f"Decryption failed: {str(e)}"}, 400
+
+    password_error = input_validation.validate_password_strength(dec_new_password)
+    if password_error:
+        return {"error": password_error}, 400
+
+    coll = get_user_collection(role)
+    user = coll.find_one({"email": dec_email})
+    invalid_response = {"error": "Invalid or expired reset code. Please request a new one."}, 400
+    if not user:
+        return invalid_response
+
+    stored_otp = user.get("reset_otp_code")
+    otp_exp = user.get("reset_otp_expiry")
+    if not stored_otp or not otp_exp:
+        return invalid_response
+
+    if otp_exp.tzinfo is None:
+        otp_exp = otp_exp.replace(tzinfo=timezone.utc).astimezone(IST)
+    if datetime.now(IST) > otp_exp:
+        return {"error": "Reset code has expired. Please request a new one."}, 400
+
+    if not verify_otp_hash(stored_otp, dec_otp):
+        attempts = int(user.get("reset_otp_attempts", 0)) + 1
+        if attempts >= MAX_PASSWORD_RESET_ATTEMPTS:
+            coll.update_one(
+                {"_id": user["_id"]},
+                {"$unset": {"reset_otp_code": "", "reset_otp_expiry": "", "reset_otp_attempts": ""}},
+            )
+            return {"error": "Too many incorrect attempts. Please request a new code."}, 429
+        coll.update_one({"_id": user["_id"]}, {"$set": {"reset_otp_attempts": attempts}})
+        return {"error": "Invalid reset code."}, 400
+
+    new_password_hash = ph.hash(dec_new_password)
+    coll.update_one(
+        {"_id": user["_id"]},
+        {
+            "$set": {"password_hash": new_password_hash},
+            "$unset": {
+                "reset_otp_code": "", "reset_otp_expiry": "", "reset_otp_attempts": "",
+                "login_attempts": "", "login_locked_until": "",
+            },
+        },
+    )
+
+    response_data = {"message": "Password reset successfully. Please log in with your new password."}
+    enc_resp, iv2 = encrypt_data(json.dumps(response_data))
+    return {"encrypted_response": enc_resp, "iv": iv2}, 200
 
 
 def _get_or_create_google_user(idinfo: dict):
@@ -331,264 +631,3 @@ def register_shop_staff(email: str, password: str, name: str, shop_id: str, role
     }
 
 
-def register_shop_owner(email: str, password: str, name: str):
-    """
-    Public self-service signup for a print shop's OWNER — mirrors
-    khelomore-server/.../Handlers/auth_handler.py's bookmyconsole_register exactly for its
-    is_cafe_owner_signup branch: `cafe_exists = db_main.cafes.find_one({"owner_email":
-    dec_email, ...})`, rejecting with "This email is not authorized..." if no cafe lists
-    it. Same gate here, against shops.owner_email instead of cafes.owner_email — a shop
-    must already have this email set as its owner_email (via the super-admin panel's 'Add
-    Print Shop' form) before that person can create their own login. No ADMIN_TOKEN
-    involved: the authorization comes from the email match, not a bearer credential,
-    which is what makes this safe to expose publicly.
-    """
-    dec_email = (email or "").strip().lower()
-    error = input_validation.validate_email(dec_email) or input_validation.validate_password_strength(password)
-    if error:
-        return {"status": 400, "error": error}
-
-    shop = db_main.shops.find_one({"owner_email": dec_email, "is_active": {"$ne": False}})
-    if not shop:
-        return {"status": 403, "error": "This email is not authorized. Please contact the platform Super Admin to list your shop first."}
-
-    if db_main.shop_staff.find_one({"email": dec_email}):
-        return {"status": 409, "error": "An account with this email already exists. Please log in instead."}
-
-    doc = {
-        "email": dec_email,
-        "name": name.strip() if name else shop.get("owner_name") or dec_email.split("@")[0],
-        "password_hash": hash_password(password),
-        "shop_id": str(shop["_id"]),
-        "role": "owner",
-        "status": "Active",
-        "created_at": datetime.now(IST).isoformat(),
-    }
-    result = db_main.shop_staff.insert_one(doc)
-    token = generate_token(dec_email, role="shop_staff")
-    return {
-        "status": 201,
-        "token": token,
-        "staff": {
-            "id": str(result.inserted_id), "email": dec_email, "name": doc["name"],
-            "shop_id": doc["shop_id"], "role": "owner",
-        },
-    }
-
-
-def login_shop_staff(email: str, password: str):
-    dec_email = (email or "").strip().lower()
-    staff = db_main.shop_staff.find_one({"email": dec_email})
-    if not staff or not staff.get("password_hash"):
-        return {"status": 401, "error": "Invalid email or password."}
-    if staff.get("status") != "Active":
-        return {"status": 403, "error": "This account is not active."}
-    if not verify_password(staff["password_hash"], password):
-        return {"status": 401, "error": "Invalid email or password."}
-
-    token = generate_token(dec_email, role="shop_staff")
-    return {
-        "status": 200,
-        "token": token,
-        "staff": {
-            "id": str(staff["_id"]),
-            "email": dec_email,
-            "name": staff.get("name", ""),
-            "shop_id": staff.get("shop_id"),
-            "role": staff.get("role", "staff"),
-        },
-    }
-
-
-# ── Super admin auth — email+password + OTP, AES-256-CBC encrypted payloads ─────────────
-# Mirrors khelomore-server's super_admin flow: register/login are step 1 (verify
-# credentials, email an OTP, no session yet), verify_super_admin_otp is step 2 (checks the
-# OTP, issues the JWT). Creating a NEW super_admin account (register) is itself gated by
-# auth_middleware.authenticate_super_admin_request at the view layer — see views.py's
-# reject_unauthorized_super_admin_role equivalent — so only an already-authenticated super
-# admin (or the static ADMIN_TOKEN) can provision another one. The very first account has
-# to be created via a one-off script that calls register_super_admin directly (see
-# create_super_admin.py), the same bootstrap approach khelomore-server itself uses.
-
-def register_super_admin(name_enc, email_enc, password_enc, iv):
-    """Step 1 of signup — creates a Pending super_admin doc, emails an OTP, no JWT yet."""
-    try:
-        dec_name = decrypt_data(name_enc, iv).strip()
-        dec_email = decrypt_data(email_enc, iv).strip().lower()
-        dec_password = decrypt_data(password_enc, iv)
-    except Exception as e:
-        return {"error": f"Decryption failed: {str(e)}"}, 400
-
-    error = (
-        input_validation.validate_text(dec_name, "Full name", max_len=40)
-        or input_validation.validate_email(dec_email)
-        or input_validation.validate_password_strength(dec_password)
-    )
-    if error:
-        return {"error": error}, 400
-
-    if db_main.super_admin.find_one({"email": dec_email}):
-        return {"error": "An account with this email already exists."}, 400
-
-    otp_code = str(random.randint(100000, 999999))
-    otp_expiry = datetime.now(IST) + timedelta(minutes=SUPER_ADMIN_OTP_EXPIRY_MINUTES)
-    db_main.super_admin.insert_one({
-        "name": dec_name,
-        "email": dec_email,
-        "password_hash": ph.hash(dec_password),
-        "status": "Pending",
-        "otp_code": hash_otp(otp_code),
-        "otp_expiry": otp_expiry,
-        "role": "super_admin",
-        "created_at": datetime.now(IST).isoformat(),
-    })
-
-    from .email_handler import send_otp_email
-    send_otp_email(dec_email, otp_code, name=dec_name, purpose="signup")
-
-    response_json = json.dumps({"message": "OTP sent to your email.", "email": dec_email})
-    enc_resp, iv2 = encrypt_data(response_json)
-    return {"encrypted_response": enc_resp, "iv": iv2}, 200
-
-
-def login_super_admin(email_enc, password_enc, iv):
-    """Step 1 of login — verifies credentials, emails an OTP, no JWT yet."""
-    try:
-        dec_email = decrypt_data(email_enc, iv).strip().lower()
-        dec_password = decrypt_data(password_enc, iv)
-    except Exception as e:
-        return {"error": f"Decryption failed: {str(e)}"}, 400
-
-    admin = db_main.super_admin.find_one({"email": dec_email})
-    if not admin:
-        return {"error": "Invalid email or password."}, 401
-    if admin.get("status") == "Suspended":
-        return {"error": "This account has been suspended."}, 403
-
-    # SECURITY: bound password-guessing against a known email.
-    locked_until = admin.get("login_locked_until")
-    if locked_until:
-        if locked_until.tzinfo is None:
-            locked_until = locked_until.replace(tzinfo=timezone.utc).astimezone(IST)
-        if datetime.now(IST) < locked_until:
-            return {"error": "Too many failed login attempts. Please try again later."}, 429
-
-    if not verify_password(admin["password_hash"], dec_password):
-        attempts = int(admin.get("login_attempts", 0)) + 1
-        update_fields = {"login_attempts": attempts}
-        if attempts >= MAX_LOGIN_ATTEMPTS:
-            update_fields["login_locked_until"] = datetime.now(IST) + timedelta(minutes=LOGIN_LOCKOUT_MINUTES)
-        db_main.super_admin.update_one({"_id": admin["_id"]}, {"$set": update_fields})
-        return {"error": "Invalid email or password."}, 401
-
-    if admin.get("login_attempts") or admin.get("login_locked_until"):
-        db_main.super_admin.update_one({"_id": admin["_id"]}, {"$unset": {"login_attempts": "", "login_locked_until": ""}})
-
-    otp_code = str(random.randint(100000, 999999))
-    otp_expiry = datetime.now(IST) + timedelta(minutes=SUPER_ADMIN_OTP_EXPIRY_MINUTES)
-    db_main.super_admin.update_one(
-        {"_id": admin["_id"]},
-        {"$set": {"otp_code": hash_otp(otp_code), "otp_expiry": otp_expiry}, "$unset": {"otp_attempts": ""}},
-    )
-
-    from .email_handler import send_otp_email
-    send_otp_email(dec_email, otp_code, name=admin.get("name", "Admin"), purpose="login")
-
-    response_json = json.dumps({"message": "OTP sent to your email.", "email": dec_email})
-    enc_resp, iv2 = encrypt_data(response_json)
-    return {"encrypted_response": enc_resp, "iv": iv2}, 200
-
-
-def verify_super_admin_otp(email_enc, otp_enc, iv):
-    """Step 2 (login + signup) — validates the OTP, activates the account, issues a JWT."""
-    try:
-        dec_email = decrypt_data(email_enc, iv).strip().lower()
-        dec_otp = decrypt_data(otp_enc, iv).strip()
-    except Exception as e:
-        return {"error": f"Decryption failed: {str(e)}"}, 400
-
-    admin = db_main.super_admin.find_one({"email": dec_email})
-    if not admin:
-        return {"error": "Session not found. Please start again."}, 404
-    if admin.get("status") == "Suspended":
-        return {"error": "This account has been suspended."}, 403
-
-    stored_otp = admin.get("otp_code")
-    otp_exp = admin.get("otp_expiry")
-    if not stored_otp or not otp_exp:
-        return {"error": "No OTP request found."}, 400
-    if otp_exp.tzinfo is None:
-        otp_exp = otp_exp.replace(tzinfo=timezone.utc).astimezone(IST)
-    if datetime.now(IST) > otp_exp:
-        return {"error": "OTP has expired. Please request a new code."}, 400
-
-    if not verify_otp_hash(stored_otp, dec_otp):
-        # SECURITY: bound OTP guessing — a 6-digit code has 1,000,000 possibilities, so
-        # unlimited attempts would make it brute-forceable.
-        attempts = int(admin.get("otp_attempts", 0)) + 1
-        if attempts >= MAX_OTP_ATTEMPTS:
-            db_main.super_admin.update_one(
-                {"_id": admin["_id"]},
-                {"$unset": {"otp_code": "", "otp_expiry": "", "otp_attempts": ""}},
-            )
-            return {"error": "Too many incorrect attempts. Please request a new code."}, 429
-        db_main.super_admin.update_one({"_id": admin["_id"]}, {"$set": {"otp_attempts": attempts}})
-        return {"error": "Invalid verification code."}, 400
-
-    is_new = admin.get("status") == "Pending"
-    update_fields = {"$unset": {"otp_code": "", "otp_expiry": "", "otp_attempts": ""}}
-    if is_new:
-        update_fields["$set"] = {"status": "Active"}
-    db_main.super_admin.update_one({"_id": admin["_id"]}, update_fields)
-
-    token = generate_token(dec_email, role="super_admin")
-    response_data = {
-        "token": token,
-        "message": "Verification successful",
-        "user": {
-            "id": str(admin["_id"]),
-            "email": dec_email,
-            "name": admin.get("name", "Admin"),
-            "role": "super_admin",
-        },
-    }
-    enc_resp, iv2 = encrypt_data(json.dumps(response_data))
-    return {"encrypted_response": enc_resp, "iv": iv2}, 200
-
-
-def resend_super_admin_otp(email_enc, iv):
-    """Re-generates and re-sends the OTP for an existing super_admin account (404s if none
-    exists — this can only ever re-send for an account, never create or promote one)."""
-    try:
-        dec_email = decrypt_data(email_enc, iv).strip().lower()
-    except Exception as e:
-        return {"error": f"Decryption failed: {str(e)}"}, 400
-
-    admin = db_main.super_admin.find_one({"email": dec_email})
-    if not admin:
-        return {"error": "No account found for this email."}, 404
-
-    # SECURITY: cooldown so resending can't be used to dodge the OTP-attempt lockout by
-    # requesting a fresh code just before hitting the attempt cap.
-    prev_expiry = admin.get("otp_expiry")
-    if prev_expiry:
-        if prev_expiry.tzinfo is None:
-            prev_expiry = prev_expiry.replace(tzinfo=timezone.utc).astimezone(IST)
-        last_sent = prev_expiry - timedelta(minutes=SUPER_ADMIN_OTP_EXPIRY_MINUTES)
-        elapsed = (datetime.now(IST) - last_sent).total_seconds()
-        if elapsed < OTP_RESEND_COOLDOWN_SECONDS:
-            wait_for = int(OTP_RESEND_COOLDOWN_SECONDS - elapsed)
-            return {"error": f"Please wait {wait_for}s before requesting another code."}, 429
-
-    otp_code = str(random.randint(100000, 999999))
-    otp_expiry = datetime.now(IST) + timedelta(minutes=SUPER_ADMIN_OTP_EXPIRY_MINUTES)
-    db_main.super_admin.update_one(
-        {"_id": admin["_id"]},
-        {"$set": {"otp_code": hash_otp(otp_code), "otp_expiry": otp_expiry}, "$unset": {"otp_attempts": ""}},
-    )
-
-    from .email_handler import send_otp_email
-    send_otp_email(dec_email, otp_code, name=admin.get("name", "Admin"), purpose="resend")
-
-    enc_resp, iv2 = encrypt_data('{"message": "New OTP sent to your email."}')
-    return {"encrypted_response": enc_resp, "iv": iv2}, 200

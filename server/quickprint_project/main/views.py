@@ -31,6 +31,30 @@ def _respond(result: dict) -> Response:
     return Response(result, status=status_code)
 
 
+ROLE_COOKIE_NAMES = {"customer": "qp_customer_token", "shop_staff": "qp_shop_token", "super_admin": "qp_super_admin_token"}
+COOKIE_MAX_AGE_SECONDS = 86400  # 24h, matching every role's JWT lifetime now
+
+
+def _set_role_cookie(response, role: str, token: str):
+    """Same flags as khelomore-server's own auth cookies: HttpOnly (JS can't read it, so
+    an XSS can't exfiltrate it directly), Secure (HTTPS only), SameSite=None (the web
+    frontends live on a different origin than this API, so the cookie must be sendable
+    cross-site — OriginValidationMiddleware is what actually guards against that being
+    abused for CSRF)."""
+    response.set_cookie(
+        key=ROLE_COOKIE_NAMES[role],
+        value=token,
+        httponly=True,
+        secure=True,
+        samesite="None",
+        max_age=COOKIE_MAX_AGE_SECONDS,
+    )
+
+
+def _clear_role_cookie(response, role: str):
+    response.delete_cookie(ROLE_COOKIE_NAMES[role], samesite="None")
+
+
 def _is_allowed_oauth_redirect_target(target: str) -> bool:
     """
     SECURITY: `return_url`/`state` is unauthenticated, attacker-influenceable input that
@@ -66,32 +90,106 @@ class StatusCheckView(APIView):
 # ── Customer auth ──────────────────────────────────────────────────────────────
 
 class CustomerRegisterView(APIView):
-    """POST /auth/register/ — Body: { email, password, name }"""
+    """POST /auth/register/ — Step 1 of signup. Body: { name, email, password, iv } (AES-CBC
+    encrypted). Returns encrypted { message, email } — an OTP is emailed, no session yet."""
     throttle_classes = [ScopedRateThrottle]
     throttle_scope = "auth"
 
     def post(self, request):
         data = request.data
-        result = auth_handler.register_customer(
-            email=data.get("email", ""),
-            password=data.get("password", ""),
-            name=data.get("name", ""),
+        result, status_code = auth_handler.register(
+            name_enc=data.get("name", ""),
+            email_enc=data.get("email", ""),
+            password_enc=data.get("password", ""),
+            iv=data.get("iv", ""),
+            role="customer",
         )
-        return _respond(result)
+        return Response(result, status=status_code)
 
 
 class CustomerLoginView(APIView):
-    """POST /auth/login/ — Body: { email, password }"""
+    """POST /auth/login/ — Step 1 of login. Body: { email, password, iv } (AES-CBC encrypted).
+    Returns encrypted { message, email } — an OTP is emailed, no session yet."""
     throttle_classes = [ScopedRateThrottle]
     throttle_scope = "auth"
 
     def post(self, request):
         data = request.data
-        result = auth_handler.login_customer(
-            email=data.get("email", ""),
-            password=data.get("password", ""),
+        result, status_code = auth_handler.login(
+            email_enc=data.get("email", ""),
+            password_enc=data.get("password", ""),
+            iv=data.get("iv", ""),
+            role="customer",
         )
-        return _respond(result)
+        return Response(result, status=status_code)
+
+
+class CustomerVerifyOTPView(APIView):
+    """POST /auth/verify-otp/ — Step 2 (login + signup). Body: { email, otp_code, iv }.
+    Returns encrypted { token, user } and sets the qp_customer_token HttpOnly cookie."""
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "auth"
+
+    def post(self, request):
+        data = request.data
+        result, status_code = auth_handler.verify_otp(
+            email_enc=data.get("email", ""),
+            otp_enc=data.get("otp_code", ""),
+            iv=data.get("iv", ""),
+            role="customer",
+        )
+        response_obj = Response(result, status=status_code)
+        if status_code == 200:
+            try:
+                import json
+                decrypted = auth_handler.decrypt_data(result["encrypted_response"], result["iv"])
+                token = json.loads(decrypted).get("token")
+                if token:
+                    _set_role_cookie(response_obj, "customer", token)
+            except Exception as e:
+                print(f"[COOKIE ERROR] Failed to set customer auth cookie: {e}")
+        return response_obj
+
+
+class CustomerResendOTPView(APIView):
+    """POST /auth/resend-otp/ — Body: { email, iv }."""
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "auth"
+
+    def post(self, request):
+        data = request.data
+        result, status_code = auth_handler.resend_otp(email_enc=data.get("email", ""), iv=data.get("iv", ""), role="customer")
+        return Response(result, status=status_code)
+
+
+class CustomerForgotPasswordView(APIView):
+    """POST /auth/forgot-password/ — Body: { email, iv }. Always the same generic response
+    regardless of whether the account exists — see auth_handler.forgot_password."""
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "auth"
+
+    def post(self, request):
+        data = request.data
+        result, status_code = auth_handler.forgot_password(email_enc=data.get("email", ""), iv=data.get("iv", ""), role="customer")
+        return Response(result, status=status_code)
+
+
+class CustomerResetPasswordView(APIView):
+    """POST /auth/reset-password/ — Body: { email, otp_code, new_password, iv }. No session
+    is issued here — the customer logs in normally afterward."""
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "auth"
+
+    def post(self, request):
+        data = request.data
+        result, status_code = auth_handler.reset_password(
+            email_enc=data.get("email", ""),
+            otp_enc=data.get("otp_code", ""),
+            new_password_enc=data.get("new_password", ""),
+            iv=data.get("iv", ""),
+            role="customer",
+        )
+        return Response(result, status=status_code)
 
 
 class CustomerGoogleLoginRedirectView(APIView):
@@ -155,19 +253,22 @@ class CustomerGoogleCallbackView(APIView):
         redirect_url = f"{state}{separator}encrypted_response={quote(enc_resp)}&iv={quote(iv)}"
         response = HttpResponse(status=302)
         response["Location"] = redirect_url
+        _set_role_cookie(response, "customer", result["token"])
         return response
 
 
 class CustomerLogoutView(APIView):
-    """POST /auth/logout/ — Body: { } (Bearer token in Authorization header)"""
+    """POST /auth/logout/ — Bearer token in Authorization header, or the qp_customer_token cookie."""
     def post(self, request):
         email, error_response = auth_middleware.authenticate_customer_request(request)
         if error_response:
             return error_response
         auth_header = request.headers.get("Authorization", "")
-        token = auth_header.split(" ")[1].strip() if auth_header.startswith("Bearer ") else ""
+        token = auth_header.split(" ")[1].strip() if auth_header.startswith("Bearer ") else request.COOKIES.get("qp_customer_token", "")
         auth_handler.revoke_token(token)
-        return Response({"message": "Logged out."}, status=200)
+        response_obj = Response({"message": "Logged out."}, status=200)
+        _clear_role_cookie(response_obj, "customer")
+        return response_obj
 
 
 class CustomerMeView(APIView):
@@ -208,11 +309,12 @@ class SuperAdminRegisterView(APIView):
         if guard_error:
             return guard_error
         data = request.data
-        result, status_code = auth_handler.register_super_admin(
+        result, status_code = auth_handler.register(
             name_enc=data.get("name", ""),
             email_enc=data.get("email", ""),
             password_enc=data.get("password", ""),
             iv=data.get("iv", ""),
+            role="super_admin",
         )
         return Response(result, status=status_code)
 
@@ -224,27 +326,40 @@ class SuperAdminLoginView(APIView):
 
     def post(self, request):
         data = request.data
-        result, status_code = auth_handler.login_super_admin(
+        result, status_code = auth_handler.login(
             email_enc=data.get("email", ""),
             password_enc=data.get("password", ""),
             iv=data.get("iv", ""),
+            role="super_admin",
         )
         return Response(result, status=status_code)
 
 
 class SuperAdminVerifyOTPView(APIView):
-    """POST /super-admin/verify-otp/ — Body: { email, otp_code, iv } (AES-CBC encrypted)"""
+    """POST /super-admin/verify-otp/ — Body: { email, otp_code, iv } (AES-CBC encrypted).
+    Sets the qp_super_admin_token HttpOnly cookie on success."""
     throttle_classes = [ScopedRateThrottle]
     throttle_scope = "auth"
 
     def post(self, request):
         data = request.data
-        result, status_code = auth_handler.verify_super_admin_otp(
+        result, status_code = auth_handler.verify_otp(
             email_enc=data.get("email", ""),
             otp_enc=data.get("otp_code", ""),
             iv=data.get("iv", ""),
+            role="super_admin",
         )
-        return Response(result, status=status_code)
+        response_obj = Response(result, status=status_code)
+        if status_code == 200:
+            try:
+                import json
+                decrypted = auth_handler.decrypt_data(result["encrypted_response"], result["iv"])
+                token = json.loads(decrypted).get("token")
+                if token:
+                    _set_role_cookie(response_obj, "super_admin", token)
+            except Exception as e:
+                print(f"[COOKIE ERROR] Failed to set super admin auth cookie: {e}")
+        return response_obj
 
 
 class SuperAdminResendOTPView(APIView):
@@ -254,9 +369,34 @@ class SuperAdminResendOTPView(APIView):
 
     def post(self, request):
         data = request.data
-        result, status_code = auth_handler.resend_super_admin_otp(
+        result, status_code = auth_handler.resend_otp(email_enc=data.get("email", ""), iv=data.get("iv", ""), role="super_admin")
+        return Response(result, status=status_code)
+
+
+class SuperAdminForgotPasswordView(APIView):
+    """POST /super-admin/forgot-password/ — Body: { email, iv }."""
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "auth"
+
+    def post(self, request):
+        data = request.data
+        result, status_code = auth_handler.forgot_password(email_enc=data.get("email", ""), iv=data.get("iv", ""), role="super_admin")
+        return Response(result, status=status_code)
+
+
+class SuperAdminResetPasswordView(APIView):
+    """POST /super-admin/reset-password/ — Body: { email, otp_code, new_password, iv }."""
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "auth"
+
+    def post(self, request):
+        data = request.data
+        result, status_code = auth_handler.reset_password(
             email_enc=data.get("email", ""),
+            otp_enc=data.get("otp_code", ""),
+            new_password_enc=data.get("new_password", ""),
             iv=data.get("iv", ""),
+            role="super_admin",
         )
         return Response(result, status=status_code)
 
@@ -288,9 +428,11 @@ class SuperAdminLogoutView(APIView):
         if error_response:
             return error_response
         auth_header = request.headers.get("Authorization", "")
-        token = auth_header.split(" ")[1].strip() if auth_header.startswith("Bearer ") else ""
+        token = auth_header.split(" ")[1].strip() if auth_header.startswith("Bearer ") else request.COOKIES.get("qp_super_admin_token", "")
         auth_handler.revoke_token(token)
-        return Response({"message": "Logged out."}, status=200)
+        response_obj = Response({"message": "Logged out."}, status=200)
+        _clear_role_cookie(response_obj, "super_admin")
+        return response_obj
 
 
 # ── Partner applications ────────────────────────────────────────────────────────
@@ -357,36 +499,108 @@ class ShopStaffRegisterView(APIView):
 
 class ShopOwnerSignupView(APIView):
     """
-    POST /shop-auth/signup/ — public self-service signup for a shop OWNER. Body:
-    { email, password, name }. Mirrors khelomore-server's cafe-owner self-registration:
-    no ADMIN_TOKEN needed, but the email must already be listed as a shop's owner_email
-    (set by the super admin via the 'Add Print Shop' form) or this returns 403.
+    POST /shop-auth/signup/ — Step 1 of public self-service signup for a shop OWNER. Body:
+    { name, email, password, iv } (AES-CBC encrypted). Mirrors khelomore-server's
+    cafe-owner self-registration: no ADMIN_TOKEN needed, but the email must already be
+    listed as a shop's owner_email (set by the super admin via 'Add Print Shop') or this
+    returns 403. Returns encrypted { message, email } — an OTP is emailed, no session yet.
     """
     throttle_classes = [ScopedRateThrottle]
     throttle_scope = "auth"
 
     def post(self, request):
         data = request.data
-        result = auth_handler.register_shop_owner(
-            email=data.get("email", ""),
-            password=data.get("password", ""),
-            name=data.get("name", ""),
+        result, status_code = auth_handler.register(
+            name_enc=data.get("name", ""),
+            email_enc=data.get("email", ""),
+            password_enc=data.get("password", ""),
+            iv=data.get("iv", ""),
+            role="shop_staff",
         )
-        return _respond(result)
+        return Response(result, status=status_code)
 
 
 class ShopStaffLoginView(APIView):
-    """POST /shop-auth/login/ — Body: { email, password }"""
+    """POST /shop-auth/login/ — Step 1 of login. Body: { email, password, iv } (AES-CBC
+    encrypted). Returns encrypted { message, email } — an OTP is emailed, no session yet."""
     throttle_classes = [ScopedRateThrottle]
     throttle_scope = "auth"
 
     def post(self, request):
         data = request.data
-        result = auth_handler.login_shop_staff(
-            email=data.get("email", ""),
-            password=data.get("password", ""),
+        result, status_code = auth_handler.login(
+            email_enc=data.get("email", ""),
+            password_enc=data.get("password", ""),
+            iv=data.get("iv", ""),
+            role="shop_staff",
         )
-        return _respond(result)
+        return Response(result, status=status_code)
+
+
+class ShopStaffVerifyOTPView(APIView):
+    """POST /shop-auth/verify-otp/ — Step 2 (login + signup). Body: { email, otp_code, iv }.
+    Returns encrypted { token, user } and sets the qp_shop_token HttpOnly cookie."""
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "auth"
+
+    def post(self, request):
+        data = request.data
+        result, status_code = auth_handler.verify_otp(
+            email_enc=data.get("email", ""),
+            otp_enc=data.get("otp_code", ""),
+            iv=data.get("iv", ""),
+            role="shop_staff",
+        )
+        response_obj = Response(result, status=status_code)
+        if status_code == 200:
+            try:
+                import json
+                decrypted = auth_handler.decrypt_data(result["encrypted_response"], result["iv"])
+                token = json.loads(decrypted).get("token")
+                if token:
+                    _set_role_cookie(response_obj, "shop_staff", token)
+            except Exception as e:
+                print(f"[COOKIE ERROR] Failed to set shop staff auth cookie: {e}")
+        return response_obj
+
+
+class ShopStaffResendOTPView(APIView):
+    """POST /shop-auth/resend-otp/ — Body: { email, iv }."""
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "auth"
+
+    def post(self, request):
+        data = request.data
+        result, status_code = auth_handler.resend_otp(email_enc=data.get("email", ""), iv=data.get("iv", ""), role="shop_staff")
+        return Response(result, status=status_code)
+
+
+class ShopStaffForgotPasswordView(APIView):
+    """POST /shop-auth/forgot-password/ — Body: { email, iv }."""
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "auth"
+
+    def post(self, request):
+        data = request.data
+        result, status_code = auth_handler.forgot_password(email_enc=data.get("email", ""), iv=data.get("iv", ""), role="shop_staff")
+        return Response(result, status=status_code)
+
+
+class ShopStaffResetPasswordView(APIView):
+    """POST /shop-auth/reset-password/ — Body: { email, otp_code, new_password, iv }."""
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "auth"
+
+    def post(self, request):
+        data = request.data
+        result, status_code = auth_handler.reset_password(
+            email_enc=data.get("email", ""),
+            otp_enc=data.get("otp_code", ""),
+            new_password_enc=data.get("new_password", ""),
+            iv=data.get("iv", ""),
+            role="shop_staff",
+        )
+        return Response(result, status=status_code)
 
 
 class ShopStaffLogoutView(APIView):
@@ -396,9 +610,11 @@ class ShopStaffLogoutView(APIView):
         if error_response:
             return error_response
         auth_header = request.headers.get("Authorization", "")
-        token = auth_header.split(" ")[1].strip() if auth_header.startswith("Bearer ") else ""
+        token = auth_header.split(" ")[1].strip() if auth_header.startswith("Bearer ") else request.COOKIES.get("qp_shop_token", "")
         auth_handler.revoke_token(token)
-        return Response({"message": "Logged out."}, status=200)
+        response_obj = Response({"message": "Logged out."}, status=200)
+        _clear_role_cookie(response_obj, "shop_staff")
+        return response_obj
 
 
 class ShopStaffMeView(APIView):

@@ -1,18 +1,16 @@
 # middleware.py
 # CSRF-style protection for cookie-authenticated requests.
-# Mirrors khelomore-server/.../middleware.py's OriginValidationMiddleware structurally.
-#
-# QuickPrint's web apps (customer hub, shop dashboard) are Bearer-token-only for v1 — no
-# auth cookies are issued, so AUTH_COOKIE_NAMES is empty and this middleware is currently
-# a structural no-op (kept in place, same as khelomore-server, so it activates
-# automatically the moment any cookie-based auth flow is added, without needing to wire
-# up this protection from scratch under time pressure later).
+# Mirrors khelomore-server/.../middleware.py's OriginValidationMiddleware exactly. Now
+# actually active: verify_otp issues qp_customer_token / qp_shop_token /
+# qp_super_admin_token HttpOnly cookies (SameSite=None, since the web frontends live on
+# separate origins from this API), so without this middleware any website could trigger
+# authenticated state-changing requests using a logged-in visitor's cookies.
 
 from django.conf import settings
 from django.http import JsonResponse
 
 UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
-AUTH_COOKIE_NAMES = ()  # e.g. ("qp_customer_token", "qp_shop_token") if cookie auth is added
+AUTH_COOKIE_NAMES = ("qp_customer_token", "qp_shop_token", "qp_super_admin_token")
 
 
 class OriginValidationMiddleware:
