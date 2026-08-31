@@ -124,9 +124,15 @@ class CustomerGoogleCallbackView(APIView):
     """
     GET /auth/google/callback/
     Receives the auth code from Google, verifies it, and redirects back to the frontend
-    with the session token attached. Mirrors khelomore-server's
-    BookMyConsoleGoogleCallbackView, minus the mobile-app cookie/scheme handling
-    QuickPrint (web-only) doesn't need.
+    with the session attached. Mirrors khelomore-server's BookMyConsoleGoogleCallbackView,
+    minus the mobile-app cookie/scheme handling QuickPrint (web-only) doesn't need.
+
+    SECURITY: the session is carried as an AES-256-CBC encrypted_response + iv, never a
+    raw token — khelomore-server never puts a directly-usable token in a redirect URL
+    either, for good reason: URLs land in server access logs, browser history, and
+    (if the landing page loads any third-party resource before clearing the URL) the
+    Referer header sent to that third party. An encrypted blob in the same spot is inert
+    without the separate ENCRYPTION_KEY, which never appears in the URL itself.
     """
     def get(self, request):
         code = request.query_params.get("code")
@@ -141,8 +147,12 @@ class CustomerGoogleCallbackView(APIView):
         if result.get("status") != 200:
             return _respond(result)
 
+        import json
+        response_json = json.dumps({"token": result["token"], "user": result["user"]})
+        enc_resp, iv = auth_handler.encrypt_data(response_json)
+
         separator = "&" if "?" in state else "?"
-        redirect_url = f"{state}{separator}token={quote(result['token'])}"
+        redirect_url = f"{state}{separator}encrypted_response={quote(enc_resp)}&iv={quote(iv)}"
         response = HttpResponse(status=302)
         response["Location"] = redirect_url
         return response
