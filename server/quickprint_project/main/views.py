@@ -95,13 +95,16 @@ def _is_allowed_oauth_redirect_target(target: str) -> bool:
     """
     SECURITY: `return_url`/`state` is unauthenticated, attacker-influenceable input that
     becomes the final redirect target after Google auth completes (carrying the session
-    token in the query string). Only our own frontends' exact origins may be used — NOT
-    an arbitrary https:// URL. Ported from khelomore-server/.../views.py's
-    _is_allowed_oauth_redirect_target, minus the bookmyconsole:// / exp:// mobile-scheme
-    cases QuickPrint doesn't have (web-only, no native app).
+    token in the query string). Only our own frontends' exact origins — or the mobile
+    app's own quickprint:// scheme (and exp:// during Expo Go/dev-client testing) — may
+    be used, NOT an arbitrary https:// URL. Ported from khelomore-server/.../views.py's
+    _is_allowed_oauth_redirect_target, which carries the identical bookmyconsole:// / exp://
+    carve-out for its own mobile app.
     """
     if not target:
         return False
+    if target.startswith('quickprint://') or target.startswith('exp://'):
+        return True
     try:
         parsed = urlparse(target)
         if parsed.scheme in ("http", "https") and parsed.netloc:
@@ -285,7 +288,16 @@ class CustomerGoogleCallbackView(APIView):
             return _respond(result)
 
         import json
-        response_json = json.dumps({"token": result["token"], "user": result["user"]})
+        # refresh_token travels inside the encrypted envelope too, not just as a cookie —
+        # the mobile app has no cookie jar at all (same reasoning as the /auth/refresh/ and
+        # logout body-fallback fixes elsewhere in this file) and decrypts this envelope
+        # directly to get both tokens. The web app ignores this extra field and keeps
+        # relying on its qp_customer_refresh cookie, so this is additive, not a behavior change.
+        response_json = json.dumps({
+            "token": result["token"],
+            "refresh_token": result.get("refresh_token"),
+            "user": result["user"],
+        })
         enc_resp, iv = auth_handler.encrypt_data(response_json)
 
         separator = "&" if "?" in state else "?"
