@@ -742,3 +742,33 @@ def register_shop_staff(email: str, password: str, name: str, shop_id: str, role
     }
 
 
+def delete_account(email: str, role: str):
+    """Permanently deletes an account and its personal data — required by Google Play for
+    any app that supports account creation. Ported from khelomore-server's
+    bookmyconsole_delete_account: the account document itself is hard-deleted, but orders
+    (customer) are anonymized rather than hard-deleted — a print shop's own revenue/queue
+    history shouldn't disappear because a customer deleted their account, only the
+    deleted person's identifiers should stop pointing at them. Also revokes every access
+    and refresh token so a copy of either captured before deletion stops working
+    immediately instead of remaining valid until natural expiry."""
+    coll = get_user_collection(role)
+    user = coll.find_one({"email": email})
+    if not user:
+        return {"status": 404, "error": "Account not found."}
+
+    if role != "shop_staff":
+        anon_email = f"deleted-{user['_id']}@quickprint.deleted"
+        db_main.orders.update_many(
+            {"user_email": email},
+            {"$set": {"user_email": anon_email}},
+        )
+
+    db_main.refresh_tokens.update_many(
+        {"email": email, "role": role},
+        {"$set": {"used": True, "revoked_reason": "account_deleted"}},
+    )
+    coll.delete_one({"_id": user["_id"]})
+
+    return {"status": 200, "message": "Account and personal data deleted."}
+
+

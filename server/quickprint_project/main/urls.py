@@ -23,6 +23,7 @@ urlpatterns = [
     path('auth/google/callback/', CustomerGoogleCallbackView.as_view(), name='customer_google_callback'),
     path('auth/logout/', CustomerLogoutView.as_view(), name='customer_logout'),
     path('auth/me/', CustomerMeView.as_view(), name='customer_me'),
+    path('auth/delete-account/', CustomerDeleteAccountView.as_view(), name='customer_delete_account'),
     path('auth/refresh/', CustomerRefreshView.as_view(), name='customer_refresh'),
 
     # ── Super admin auth ─────────────────────────────────────────────────────

@@ -307,7 +307,8 @@ class CustomerLogoutView(APIView):
         auth_header = request.headers.get("Authorization", "")
         token = auth_header.split(" ")[1].strip() if auth_header.startswith("Bearer ") else request.COOKIES.get("qp_customer_token", "")
         auth_handler.revoke_token(token)
-        auth_handler.revoke_refresh_family(request.COOKIES.get("qp_customer_refresh", ""))
+        raw_refresh = request.COOKIES.get("qp_customer_refresh") or _get_body_str_field(request, "refresh_token")
+        auth_handler.revoke_refresh_family(raw_refresh)
         response_obj = Response({"message": "Logged out."}, status=200)
         _clear_role_cookies(response_obj, "customer")
         return response_obj
@@ -324,6 +325,17 @@ class CustomerMeView(APIView):
         if not user:
             return Response({"error": "Account not found."}, status=404)
         return Response({"id": str(user["_id"]), "email": email, "name": user.get("name", "")})
+
+
+class CustomerDeleteAccountView(APIView):
+    """POST /auth/delete-account/ — permanently deletes the current customer's account and
+    personal data. Required by Google Play for any app that supports account creation."""
+    def post(self, request):
+        email, error_response = auth_middleware.authenticate_customer_request(request)
+        if error_response:
+            return error_response
+        result = auth_handler.delete_account(email, role="customer")
+        return _respond(result)
 
 
 class CustomerRefreshView(APIView):
@@ -516,7 +528,8 @@ class SuperAdminLogoutView(APIView):
         auth_header = request.headers.get("Authorization", "")
         token = auth_header.split(" ")[1].strip() if auth_header.startswith("Bearer ") else request.COOKIES.get("qp_super_admin_token", "")
         auth_handler.revoke_token(token)
-        auth_handler.revoke_refresh_family(request.COOKIES.get("qp_super_admin_refresh", ""))
+        raw_refresh = request.COOKIES.get("qp_super_admin_refresh") or _get_body_str_field(request, "refresh_token")
+        auth_handler.revoke_refresh_family(raw_refresh)
         response_obj = Response({"message": "Logged out."}, status=200)
         _clear_role_cookies(response_obj, "super_admin")
         return response_obj
@@ -702,7 +715,8 @@ class ShopStaffLogoutView(APIView):
         auth_header = request.headers.get("Authorization", "")
         token = auth_header.split(" ")[1].strip() if auth_header.startswith("Bearer ") else request.COOKIES.get("qp_shop_token", "")
         auth_handler.revoke_token(token)
-        auth_handler.revoke_refresh_family(request.COOKIES.get("qp_shop_refresh", ""))
+        raw_refresh = request.COOKIES.get("qp_shop_refresh") or _get_body_str_field(request, "refresh_token")
+        auth_handler.revoke_refresh_family(raw_refresh)
         response_obj = Response({"message": "Logged out."}, status=200)
         _clear_role_cookies(response_obj, "shop_staff")
         return response_obj
