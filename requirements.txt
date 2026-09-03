@@ -18,6 +18,9 @@ pymongo==3.11.4
 # standard connection string format) — see khelomore-server/requirements.txt for why
 # this is easy to miss in a static import audit.
 dnspython==2.7.0
+# db_connection.py pins TLS verification to this CA bundle explicitly (see the comment
+# there) rather than relying on it being pulled in transitively by requests/google-auth.
+certifi==2024.8.30
 
 # ── Auth / crypto ─────────────────────────────
 PyJWT==2.10.1

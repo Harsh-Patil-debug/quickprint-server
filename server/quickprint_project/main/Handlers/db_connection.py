@@ -4,6 +4,7 @@
 # ─────────────────────────────────────────────
 
 import os
+import certifi
 import pymongo
 from pathlib import Path
 from dotenv import load_dotenv
@@ -26,7 +27,21 @@ def get_db():
             print("[QuickPrint] MONGO_URL environment variable is not set.")
             return None
         try:
-            _client = pymongo.MongoClient(MONGO_URL, serverSelectionTimeoutMS=5000)
+            # tlsCAFile=certifi.where() pins TLS verification to certifi's actively-maintained
+            # Mozilla CA bundle instead of letting pymongo/OpenSSL fall back to discovering
+            # trust roots via the OS certificate store. That OS-store lookup is where this
+            # broke on Windows: pymongo 3.11's bundled OpenSSL negotiates a handshake Atlas's
+            # TLS termination rejects outright (TLSV1_ALERT_INTERNAL_ERROR on every shard,
+            # confirmed live) well before certificates are even compared — this fixes the
+            # handshake itself, not just certificate trust, and does NOT weaken verification
+            # in any way (still full hostname + chain validation, just against a known-good,
+            # regularly-updated bundle instead of whatever the OS happens to have).
+            _client = pymongo.MongoClient(
+                MONGO_URL,
+                serverSelectionTimeoutMS=5000,
+                tls=True,
+                tlsCAFile=certifi.where(),
+            )
             # Ping database to force connection check
             _client.admin.command('ping')
             print(f"[QuickPrint] MongoDB connected successfully - database: '{MONGO_DB_NAME}'")
