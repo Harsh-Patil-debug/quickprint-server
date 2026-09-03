@@ -18,7 +18,7 @@ SEED_SHOPS = [
         "phone": "+91 98220 41102", "lat": 18.5679, "lng": 73.9143,
         "rate_bw": 1.0, "rate_color": 6, "color": True, "spiral": True, "open24": True,
         "hours": "Open 24 hours", "rating": 4.8,
-        "image_url": "https://res.cloudinary.com/dx1ulvuqy/image/upload/v1787860911/quickprint/shops/zzvlnfslwcvypdcfdsan.jpg",
+        "image_urls": ["https://res.cloudinary.com/dx1ulvuqy/image/upload/v1787860911/quickprint/shops/zzvlnfslwcvypdcfdsan.jpg"],
     },
     {
         "name": "CampusStation Copy Point", "area": "Central Library Lane",
@@ -26,7 +26,7 @@ SEED_SHOPS = [
         "phone": "+91 99700 33821", "lat": 18.5700, "lng": 73.9100,
         "rate_bw": 0.9, "rate_color": 5, "color": True, "spiral": True, "open24": False,
         "hours": "8:00 AM – 11:00 PM", "rating": 4.6,
-        "image_url": "https://res.cloudinary.com/dx1ulvuqy/image/upload/v1787860913/quickprint/shops/kfrnpkywfeea0nt9qwsi.jpg",
+        "image_urls": ["https://res.cloudinary.com/dx1ulvuqy/image/upload/v1787860913/quickprint/shops/kfrnpkywfeea0nt9qwsi.jpg"],
     },
     {
         "name": "SwiftKopy Express", "area": "Hostel C Arcade",
@@ -34,7 +34,7 @@ SEED_SHOPS = [
         "phone": "+91 91450 77219", "lat": 18.5650, "lng": 73.9160,
         "rate_bw": 1.2, "rate_color": 7, "color": False, "spiral": False, "open24": False,
         "hours": "9:00 AM – 10:00 PM", "rating": 4.4,
-        "image_url": "https://res.cloudinary.com/dx1ulvuqy/image/upload/v1787860913/quickprint/shops/g2tkzndkvorsvk4dtlhd.jpg",
+        "image_urls": ["https://res.cloudinary.com/dx1ulvuqy/image/upload/v1787860913/quickprint/shops/g2tkzndkvorsvk4dtlhd.jpg"],
     },
     {
         "name": "InkPost Business Centre", "area": "Tech Park Tower B",
@@ -42,7 +42,7 @@ SEED_SHOPS = [
         "phone": "+91 98501 26644", "lat": 18.5158, "lng": 73.9315,
         "rate_bw": 1.5, "rate_color": 8, "color": True, "spiral": True, "open24": False,
         "hours": "7:00 AM – 9:00 PM", "rating": 4.9,
-        "image_url": "https://res.cloudinary.com/dx1ulvuqy/image/upload/v1787860914/quickprint/shops/v8m6qaeuvcfscf7ujblr.jpg",
+        "image_urls": ["https://res.cloudinary.com/dx1ulvuqy/image/upload/v1787860914/quickprint/shops/v8m6qaeuvcfscf7ujblr.jpg"],
     },
     {
         "name": "PrintDrop Corner", "area": "Metro Station Exit 3",
@@ -50,7 +50,7 @@ SEED_SHOPS = [
         "phone": "+91 90040 51188", "lat": 18.5550, "lng": 73.9200,
         "rate_bw": 1.1, "rate_color": 6.5, "color": True, "spiral": False, "open24": True,
         "hours": "Open 24 hours", "rating": 4.2,
-        "image_url": "https://res.cloudinary.com/dx1ulvuqy/image/upload/v1787860915/quickprint/shops/sfos3pxvyssa4iksrgoc.jpg",
+        "image_urls": ["https://res.cloudinary.com/dx1ulvuqy/image/upload/v1787860915/quickprint/shops/sfos3pxvyssa4iksrgoc.jpg"],
     },
 ]
 
@@ -94,7 +94,7 @@ def map_shop_doc(doc, user_lat=None, user_lon=None):
         "area": doc.get("area", ""),
         "address": doc.get("address", ""),
         "phone": doc.get("phone", ""),
-        "imageUrl": doc.get("image_url"),
+        "imageUrls": doc.get("image_urls") or [],
         "lat": doc.get("lat"),
         "lng": doc.get("lng"),
         "distanceKm": distance_km,
@@ -173,16 +173,33 @@ def map_shop_doc_admin(doc):
 ADMIN_EDITABLE_SHOP_FIELDS = {
     "name", "area", "address", "city", "state", "phone", "lat", "lng",
     "rate_bw", "rate_color", "color", "spiral", "open24", "hours",
-    "rating", "reviews", "image_url", "owner_name", "owner_email",
+    "rating", "reviews", "owner_name", "owner_email",
     "website", "instagram", "notes",
 }
 _ADMIN_NUMERIC_FIELDS = {"rate_bw", "rate_color", "lat", "lng", "rating", "reviews"}
 _ADMIN_BOOL_FIELDS = {"color", "spiral", "open24"}
+MAX_SHOP_IMAGES = 3
+
+
+def _clean_image_urls(value):
+    """Coerces a client-supplied `image_urls` into a clean list of up to MAX_SHOP_IMAGES
+    non-empty URL strings, or None if `value` isn't even a list. Silently caps rather than
+    erroring on >3 — the admin panel's own upload UI already enforces the limit, so this is
+    a defensive boundary check, not the primary UX control."""
+    if not isinstance(value, list):
+        return None
+    cleaned = [str(u).strip() for u in value if isinstance(u, str) and str(u).strip()]
+    return cleaned[:MAX_SHOP_IMAGES]
 
 
 def _clean_admin_shop_fields(updates: dict):
     """Shared validation/coercion for admin create+update — returns (clean_dict, error)."""
     clean = {}
+    if "image_urls" in updates:
+        urls = _clean_image_urls(updates["image_urls"])
+        if urls is None:
+            return None, "'image_urls' must be a list of image URLs."
+        clean["image_urls"] = urls
     for key in ADMIN_EDITABLE_SHOP_FIELDS:
         if key not in updates or updates[key] in (None, ""):
             continue
@@ -282,7 +299,7 @@ def admin_restore_shop_handler(shop_id: str):
     return {"status": 200, "shop": map_shop_doc_admin(doc)}
 
 
-EDITABLE_SHOP_FIELDS = {"rate_bw", "rate_color", "hours", "color", "spiral", "open24", "phone", "address", "image_url"}
+EDITABLE_SHOP_FIELDS = {"rate_bw", "rate_color", "hours", "color", "spiral", "open24", "phone", "address"}
 
 
 def update_shop_handler(shop_id: str, updates: dict):
@@ -296,6 +313,11 @@ def update_shop_handler(shop_id: str, updates: dict):
         return {"status": 404, "error": "Shop not found."}
 
     clean = {}
+    if "image_urls" in updates:
+        urls = _clean_image_urls(updates["image_urls"])
+        if urls is None:
+            return {"status": 400, "error": "'image_urls' must be a list of image URLs."}
+        clean["image_urls"] = urls
     for key in EDITABLE_SHOP_FIELDS:
         if key not in updates:
             continue
