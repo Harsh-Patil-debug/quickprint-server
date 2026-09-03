@@ -342,7 +342,7 @@ class CustomerRefreshView(APIView):
             _clear_role_cookies(response_obj, "customer")
             return response_obj
         access_token, refresh_token = pair
-        response_obj = Response({"token": access_token}, status=200)
+        response_obj = Response({"token": access_token, "refresh_token": refresh_token}, status=200)
         _set_access_cookie(response_obj, "customer", access_token)
         _set_refresh_cookie(response_obj, "customer", refresh_token)
         return response_obj
@@ -498,7 +498,7 @@ class SuperAdminRefreshView(APIView):
             _clear_role_cookies(response_obj, "super_admin")
             return response_obj
         access_token, refresh_token = pair
-        response_obj = Response({"token": access_token}, status=200)
+        response_obj = Response({"token": access_token, "refresh_token": refresh_token}, status=200)
         _set_access_cookie(response_obj, "super_admin", access_token)
         _set_refresh_cookie(response_obj, "super_admin", refresh_token)
         return response_obj
@@ -730,7 +730,7 @@ class ShopStaffRefreshView(APIView):
             _clear_role_cookies(response_obj, "shop_staff")
             return response_obj
         access_token, refresh_token = pair
-        response_obj = Response({"token": access_token}, status=200)
+        response_obj = Response({"token": access_token, "refresh_token": refresh_token}, status=200)
         _set_access_cookie(response_obj, "shop_staff", access_token)
         _set_refresh_cookie(response_obj, "shop_staff", refresh_token)
         return response_obj
