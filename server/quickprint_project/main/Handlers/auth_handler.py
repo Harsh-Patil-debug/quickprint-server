@@ -380,6 +380,59 @@ def register(name_enc, email_enc, password_enc, iv, role: str):
     return {"encrypted_response": enc_resp, "iv": iv2}, 200
 
 
+# ── Super admin invites ──────────────────────────────────────────────────────────────
+# Authorization-by-email-match for super_admin accounts, same principle as shops'
+# owner_email for shop owners: an existing super admin invites an email here, and that
+# specific email can then hit /super-admin/register/ itself with no bearer token needed
+# (see is_super_admin_invited, checked by SuperAdminRegisterView before falling back to
+# requiring an authenticated admin). Kept in its own collection rather than a field on the
+# super_admin doc since an invite exists before any account does.
+
+def invite_super_admin(email: str, invited_by: str):
+    dec_email = (email or "").strip().lower()
+    error = input_validation.validate_email(dec_email)
+    if error:
+        return {"error": error}, 400
+    if db_main.super_admin.find_one({"email": dec_email}):
+        return {"error": "An account with this email already exists."}, 400
+    if db_main.super_admin_invites.find_one({"email": dec_email}):
+        return {"error": "This email has already been invited."}, 400
+    db_main.super_admin_invites.insert_one({
+        "email": dec_email,
+        "invited_by": invited_by,
+        "invited_at": datetime.now(IST).isoformat(),
+    })
+    return {"message": f"Invited {dec_email}. They can now create their own account at the console's login page."}, 200
+
+
+def list_super_admin_invites():
+    docs = list(db_main.super_admin_invites.find({}).sort("invited_at", -1))
+    return {
+        "invites": [
+            {"email": d["email"], "invitedBy": d.get("invited_by", ""), "invitedAt": d.get("invited_at", "")}
+            for d in docs
+        ]
+    }, 200
+
+
+def revoke_super_admin_invite(email: str):
+    dec_email = (email or "").strip().lower()
+    result = db_main.super_admin_invites.delete_one({"email": dec_email})
+    if result.deleted_count == 0:
+        return {"error": "No pending invite for this email."}, 404
+    return {"message": "Invite revoked."}, 200
+
+
+def is_super_admin_invited(email: str) -> bool:
+    return db_main.super_admin_invites.find_one({"email": (email or "").strip().lower()}) is not None
+
+
+def consume_super_admin_invite(email: str):
+    """Called once an invited email's account is actually created, so the pending-invites
+    list accurately reflects who's still waiting to sign up, not who already has."""
+    db_main.super_admin_invites.delete_one({"email": (email or "").strip().lower()})
+
+
 def login(email_enc, password_enc, iv, role: str):
     """Step 1 of login — verifies credentials, emails an OTP, no JWT yet."""
     try:

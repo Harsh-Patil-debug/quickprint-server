@@ -36,6 +36,8 @@ urlpatterns = [
     path('super-admin/logout/', SuperAdminLogoutView.as_view(), name='super_admin_logout'),
     path('super-admin/me/', SuperAdminMeView.as_view(), name='super_admin_me'),
     path('super-admin/refresh/', SuperAdminRefreshView.as_view(), name='super_admin_refresh'),
+    path('super-admin/invites/', SuperAdminInviteListCreateView.as_view(), name='super_admin_invites'),
+    path('super-admin/invites/<str:email>/', SuperAdminInviteDetailView.as_view(), name='super_admin_invite_detail'),
 
     # ── Partner applications ─────────────────────────────────────────────────
     path('partner-applications/', PartnerApplicationListCreateView.as_view(), name='partner_applications'),

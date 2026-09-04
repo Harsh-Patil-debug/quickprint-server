@@ -374,18 +374,12 @@ class CustomerRefreshView(APIView):
 
 # ── Super admin auth ────────────────────────────────────────────────────────────
 # Email+password + OTP, AES-256-CBC encrypted payloads — same security model as
-# khelomore-server's super_admin flow. Register is itself gated so only an
-# already-authenticated super admin (or the static ADMIN_TOKEN) can provision another
-# one; the very first account is created via create_super_admin.py (see that script).
-
-def _reject_unauthorized_super_admin_register(request):
-    """SECURITY: without this, anyone could hit /super-admin/register/ and self-provision
-    a super admin account. Returns a 403 Response if blocked, otherwise None."""
-    _, error_response = auth_middleware.authenticate_super_admin_request(request)
-    if error_response:
-        return Response({"error": "Not authorized to create a super admin account."}, status=403)
-    return None
-
+# khelomore-server's super_admin flow. Register is gated two ways: an already-
+# authenticated super admin (or the static ADMIN_TOKEN) can provision another one
+# directly, OR the target email can self-register if a super admin already invited it
+# (auth_handler.invite_super_admin — same authorization-by-email-match principle as
+# shops.owner_email for shop owners). The very first account is created via
+# create_super_admin.py (see that script), which bypasses both paths on purpose.
 
 class SuperAdminRegisterView(APIView):
     """POST /super-admin/register/ — Body: { name, email, password, iv } (AES-CBC encrypted)"""
@@ -393,10 +387,16 @@ class SuperAdminRegisterView(APIView):
     throttle_scope = "auth"
 
     def post(self, request):
-        guard_error = _reject_unauthorized_super_admin_register(request)
-        if guard_error:
-            return guard_error
         data = request.data
+        try:
+            dec_email = auth_handler.decrypt_data(data.get("email", ""), data.get("iv", "")).strip().lower()
+        except Exception:
+            dec_email = ""
+
+        _, error_response = auth_middleware.authenticate_super_admin_request(request)
+        if error_response and not (dec_email and auth_handler.is_super_admin_invited(dec_email)):
+            return Response({"error": "Not authorized to create a super admin account."}, status=403)
+
         result, status_code = auth_handler.register(
             name_enc=data.get("name", ""),
             email_enc=data.get("email", ""),
@@ -404,6 +404,38 @@ class SuperAdminRegisterView(APIView):
             iv=data.get("iv", ""),
             role="super_admin",
         )
+        if status_code == 200:
+            auth_handler.consume_super_admin_invite(dec_email)
+        return Response(result, status=status_code)
+
+
+class SuperAdminInviteListCreateView(APIView):
+    """GET /super-admin/invites/ — pending invites, newest first.
+    POST /super-admin/invites/ — Body: { email } (plain — caller is already authenticated,
+    unlike the public auth endpoints, so this doesn't need AES encryption)."""
+    def get(self, request):
+        identifier, error_response = auth_middleware.authenticate_super_admin_request(request)
+        if error_response:
+            return error_response
+        result, status_code = auth_handler.list_super_admin_invites()
+        return Response(result, status=status_code)
+
+    def post(self, request):
+        identifier, error_response = auth_middleware.authenticate_super_admin_request(request)
+        if error_response:
+            return error_response
+        invited_by = "" if identifier == "super_admin_static" else identifier
+        result, status_code = auth_handler.invite_super_admin(request.data.get("email", ""), invited_by)
+        return Response(result, status=status_code)
+
+
+class SuperAdminInviteDetailView(APIView):
+    """DELETE /super-admin/invites/<email>/ — revoke a not-yet-used invite."""
+    def delete(self, request, email):
+        _, error_response = auth_middleware.authenticate_super_admin_request(request)
+        if error_response:
+            return error_response
+        result, status_code = auth_handler.revoke_super_admin_invite(email)
         return Response(result, status=status_code)
 
 

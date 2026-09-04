@@ -2,11 +2,12 @@
 create_super_admin.py — one-off bootstrap for QuickPrint's first super admin account.
 
 SuperAdminRegisterView (POST /super-admin/register/) deliberately requires an
-already-authenticated super admin (or the static ADMIN_TOKEN) to create a NEW super_admin
-account — otherwise anyone could self-provision one. That guard lives at the view layer,
-so this script bypasses it on purpose by calling auth_handler.register_super_admin()
-directly, then verifies the OTP (printed to this console — DEBUG=True logs it) so the
-account is Active and ready to log in with, no email needed for this one-time step.
+already-authenticated super admin, an invited email (see auth_handler.invite_super_admin),
+or the static ADMIN_TOKEN to create a NEW super_admin account — otherwise anyone could
+self-provision one. That guard lives at the view layer, so this script bypasses it on
+purpose by calling auth_handler.register(..., role="super_admin") directly, then verifies
+the OTP (printed to this console — DEBUG=True logs it) so the account is Active and ready
+to log in with, no email needed for this one-time step.
 
 Usage:
     python create_super_admin.py <name> <email>
@@ -18,8 +19,9 @@ while this runs).
 Example:
     python create_super_admin.py "Harsh Patil" harsh@quickprint.app
 
-After this, log in normally at the admin panel's /login page — subsequent super admin
-accounts can be created from within the app itself once you're logged in.
+After this, log in normally at the admin panel's /login page — from there, invite
+additional super admins from the console itself (Settings -> Invite Admin) rather than
+re-running this script.
 """
 
 import os
@@ -69,7 +71,7 @@ def main():
     password_enc = _encrypt(password, iv_bytes)
 
     print(f"\n[1/2] Registering {email}...")
-    result, status = auth_handler.register_super_admin(name_enc, email_enc, password_enc, iv_b64)
+    result, status = auth_handler.register(name_enc, email_enc, password_enc, iv_b64, role="super_admin")
     if status != 200:
         print(f"Registration failed: {result}")
         sys.exit(1)
@@ -84,7 +86,7 @@ def main():
     otp_enc_verify = _encrypt(otp_code, verify_iv_bytes)
 
     print("[2/2] Verifying OTP and activating account...")
-    verify_result, verify_status = auth_handler.verify_super_admin_otp(email_enc_verify, otp_enc_verify, verify_iv_b64)
+    verify_result, verify_status = auth_handler.verify_otp(email_enc_verify, otp_enc_verify, verify_iv_b64, role="super_admin")
     if verify_status != 200:
         print(f"Verification failed: {verify_result}")
         sys.exit(1)
