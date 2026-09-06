@@ -1,0 +1,73 @@
+# Render Blueprint — see https://render.com/docs/blueprint-spec
+#
+# requirements.txt lives at the repo root but the Django project itself lives in
+# server/, so build/start commands install from root then `cd server` for anything
+# Django-specific — mirrors khelomore-server's render.yaml exactly.
+#
+# Using this Blueprint (New -> Blueprint in the Render dashboard, pointed at this repo)
+# reproduces the exact config below. If your Web Service was created manually instead,
+# this file documents the equivalent dashboard settings you should already have — see
+# Build Command / Start Command / env vars.
+services:
+  - type: web
+    name: quickprint-server
+    runtime: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt && cd server && python manage.py collectstatic --noinput && python manage.py migrate"
+    # --timeout 60: gunicorn's default worker timeout is 30s. Render's free-tier CPU is
+    # heavily throttled, and a slow request (Argon2 password verify, a cold Mongo Atlas
+    # connection, etc.) can brush against that default — mirrors khelomore-server's fix
+    # for the same real production issue there.
+    startCommand: "cd server && gunicorn server.wsgi:application --bind 0.0.0.0:$PORT --timeout 60"
+    envVars:
+      # Secrets — set these manually in the Render dashboard (Environment tab); never
+      # commit real values. See server/.env.example for what each one does.
+      - key: DJANGO_SECRET_KEY
+        sync: false
+      - key: MONGO_URL
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: ENCRYPTION_KEY
+        sync: false
+      - key: ADMIN_TOKEN
+        sync: false
+      - key: ALLOWED_HOSTS
+        sync: false
+      - key: CORS_ALLOWED_ORIGINS
+        sync: false
+      - key: BACKEND_URL
+        sync: false
+      - key: CUSTOMER_WEB_URL
+        sync: false
+      - key: SHOP_DASHBOARD_URL
+        sync: false
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: CASHFREE_CLIENT_ID
+        sync: false
+      - key: CASHFREE_CLIENT_SECRET
+        sync: false
+      - key: CASHFREE_ENV
+        sync: false
+      - key: CLOUDINARY_CLOUD_NAME
+        sync: false
+      - key: CLOUDINARY_API_KEY
+        sync: false
+      - key: CLOUDINARY_API_SECRET
+        sync: false
+      - key: BREVO_API_KEY
+        sync: false
+      - key: EMAIL_SENDER
+        sync: false
+      - key: SUPPORT_EMAIL
+        sync: false
+      # Non-secret config — safe defaults, override in the dashboard if needed.
+      - key: DEBUG
+        value: "False"
+      - key: MONGO_DB_NAME
+        value: QuickPrintDB
+      - key: PYTHON_VERSION
+        value: "3.12.0"
