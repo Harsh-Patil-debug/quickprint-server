@@ -9,6 +9,7 @@ import os
 from datetime import datetime, timezone, timedelta
 import cloudinary
 import cloudinary.uploader
+import cloudinary.utils
 from pypdf import PdfReader
 from pypdf.errors import PdfReadError
 from .db_connection import db_main
@@ -65,11 +66,46 @@ def _real_page_count(uploaded_file, content_type: str):
         return None, f"Couldn't read this PDF: {e}"
 
 
+def _build_pdf_page_thumbnails(uploaded_file, page_count: int) -> list[str]:
+    """
+    Uploads the SAME pdf a second time as a Cloudinary 'image' resource — the raw upload
+    above is deliberately untouched/undeliverable-as-image so the shop always gets the
+    original file byte-for-byte, but Cloudinary can only render individual PDF pages as
+    JPGs for resources uploaded (or referenced) as resource_type='image'. This second
+    copy exists purely to generate the page-by-page preview strip in the app; it is not
+    what gets sent to the shop for printing. Returns [] (never raises) on any failure —
+    a missing preview thumbnail isn't worth blocking the whole upload over.
+    """
+    try:
+        uploaded_file.seek(0)
+        preview = cloudinary.uploader.upload(
+            uploaded_file,
+            resource_type="image",
+            folder="quickprint/documents/previews",
+        )
+        uploaded_file.seek(0)
+        public_id = preview.get("public_id")
+        if not public_id:
+            return []
+        urls = []
+        for page in range(1, page_count + 1):
+            url, _ = cloudinary.utils.cloudinary_url(
+                public_id, resource_type="image", page=page, format="jpg", width=400, crop="fit",
+            )
+            urls.append(url)
+        return urls
+    except Exception:
+        return []
+
+
 def upload_print_document_handler(user_email: str, uploaded_file):
     """
-    Returns {status, upload_id, file_name, page_count} on success, or {status, error} on
-    failure. Stored as a Cloudinary 'raw' resource (not 'image') so a PDF is preserved as
-    a downloadable document, not re-encoded/transformed the way an image upload would be.
+    Returns {status, upload_id, file_name, page_count, thumbnail_urls} on success, or
+    {status, error} on failure. The real document is stored as a Cloudinary 'raw'
+    resource (not 'image') so it's preserved as a downloadable document, not
+    re-encoded/transformed the way an image upload would be — thumbnail_urls (a real,
+    per-page preview image for a PDF, or just the file itself for an image upload) comes
+    from a separate, disposable preview copy — see _build_pdf_page_thumbnails.
 
     Persists the verified {file_url, file_name, page_count} in `pending_uploads`, keyed
     by upload_id and scoped to user_email — orders_handler.create_order_draft() looks
@@ -99,6 +135,11 @@ def upload_print_document_handler(user_email: str, uploaded_file):
     if not file_url:
         return {"status": 500, "error": "Upload failed: no URL returned."}
 
+    if content_type in ("image/jpeg", "image/png"):
+        thumbnail_urls = [file_url]
+    else:
+        thumbnail_urls = _build_pdf_page_thumbnails(uploaded_file, page_count)
+
     file_name = getattr(uploaded_file, "name", "document")
     _ensure_pending_uploads_index()
     doc = {
@@ -106,6 +147,7 @@ def upload_print_document_handler(user_email: str, uploaded_file):
         "file_url": file_url,
         "file_name": file_name,
         "page_count": page_count,
+        "thumbnail_urls": thumbnail_urls,
         "created_at": datetime.now(IST).isoformat(),
         "expires_at": datetime.now(timezone.utc) + timedelta(hours=2),
     }
@@ -116,6 +158,7 @@ def upload_print_document_handler(user_email: str, uploaded_file):
         "upload_id": str(result.inserted_id),
         "file_name": file_name,
         "page_count": page_count,
+        "thumbnail_urls": thumbnail_urls,
     }
 
 
