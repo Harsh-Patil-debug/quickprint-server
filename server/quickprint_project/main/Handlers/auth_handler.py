@@ -53,6 +53,12 @@ JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
 # whole session lineage is revoked defensively, not just that one token.
 ACCESS_TOKEN_EXP_SECONDS = int(os.getenv("ACCESS_TOKEN_EXP_SECONDS", "1800"))  # 30 min
 REFRESH_TOKEN_EXP_SECONDS = int(os.getenv("REFRESH_TOKEN_EXP_SECONDS", "86400"))  # 24h
+# Customers (the mobile app's actual end users) get a much longer-lived refresh token than
+# admin/shop-staff sessions — mirrors khelomore-server's own gamer-role exception for the
+# identical reason: a consumer mobile app re-prompting for a password every single day (as
+# soon as a 24h refresh token expires between sessions) is real, reported friction, while a
+# web-based admin/shop-staff panel genuinely benefits from staying tighter for security.
+CUSTOMER_REFRESH_TOKEN_EXP_SECONDS = int(os.getenv("CUSTOMER_REFRESH_TOKEN_EXP_SECONDS", str(60 * 60 * 24 * 30)))  # 30 days
 
 # ── OTP auth — AES-256-CBC field encryption, same security model as khelomore-server's
 # super_admin flow, now applied uniformly to ALL THREE roles (customer, shop_staff,
@@ -206,6 +212,7 @@ def _issue_refresh_token(email: str, role: str, family_id: str = None) -> str:
     import secrets
     raw_token = secrets.token_urlsafe(48)
     family_id = family_id or uuid.uuid4().hex
+    exp_seconds = CUSTOMER_REFRESH_TOKEN_EXP_SECONDS if role == "customer" else REFRESH_TOKEN_EXP_SECONDS
     db_main.refresh_tokens.create_index("expires_at", expireAfterSeconds=0)
     db_main.refresh_tokens.insert_one({
         "token_hash": _hash_refresh_token(raw_token),
@@ -214,7 +221,7 @@ def _issue_refresh_token(email: str, role: str, family_id: str = None) -> str:
         "family_id": family_id,
         "used": False,
         "created_at": datetime.now(IST).isoformat(),
-        "expires_at": datetime.now(timezone.utc) + timedelta(seconds=REFRESH_TOKEN_EXP_SECONDS),
+        "expires_at": datetime.now(timezone.utc) + timedelta(seconds=exp_seconds),
     })
     return raw_token
 
